@@ -1,0 +1,6113 @@
+# =========================
+# 📦 IMPORTS
+# =========================
+
+import os
+import time
+import threading
+import queue
+import json
+import tempfile
+import random
+from contextlib import contextmanager
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+import requests
+import psycopg2
+from psycopg2 import pool as pg_pool
+
+def escape_markdown(text):
+    if not text:
+        return ""
+    # Escaping for Markdown V1
+    return text.replace("_", "\\_").replace("*", "\\*").replace("[", "\\[").replace("`", "\\`")
+
+ # make sure to have this file for cross-instance forwarding
+import psycopg2
+from psycopg2 import pool as pg_pool
+from psycopg2.extras import execute_values
+import requests
+import telebot
+from telebot.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio, InputMediaAnimation
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+
+# =========================
+# ⚙ CONFIGURATION
+# =========================
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+FIRST_ADMIN_ID = os.getenv("ADMIN_ID") # replace with your Telegram ID for initial admin access
+
+
+REQUIRED_MEDIA = 12
+
+def get_inactivity_limit():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM settings WHERE key='inactivity_limit_hours'")
+                row = c.fetchone()
+                if row and row[0].isdigit():
+                    return int(row[0]) * 3600
+    except Exception:
+        pass
+    return 6 * 3600  # 6 hours base fallback
+
+def get_new_user_grace_hours():
+    try:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT value FROM settings WHERE key='new_user_grace_hours'")
+                row = c.fetchone()
+                if row and row[0].isdigit():
+                    return int(row[0])
+    except Exception:
+        pass
+    return 1  # 1 hour base fallback
+
+FORWARD_DELAY = float(os.getenv("FORWARD_DELAY", "0.05"))
+SEND_MAX_WORKERS = int(os.getenv("SEND_MAX_WORKERS", "15"))
+SEND_RETRIES = int(os.getenv("SEND_RETRIES", "2"))
+RECEIVER_CACHE_TTL = int(os.getenv("RECEIVER_CACHE_TTL", "10"))
+BROADCAST_QUEUE_SIZE = int(os.getenv("BROADCAST_QUEUE_SIZE", "5000"))
+DB_POOL_MIN_CONN = int(os.getenv("DB_POOL_MIN_CONN", "1"))
+DB_POOL_MAX_CONN = int(os.getenv("DB_POOL_MAX_CONN", "20"))
+MESSAGE_MAP_MODE = os.getenv("MESSAGE_MAP_MODE", "full").strip().lower()
+MAP_RETENTION_DAYS = int(os.getenv("MAP_RETENTION_DAYS", "2"))
+MAP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MAP_CLEANUP_INTERVAL_SECONDS", "300"))
+MAP_INSERT_BATCH_SIZE = int(os.getenv("MAP_INSERT_BATCH_SIZE", "1000"))
+MAP_DELETE_BATCH_SIZE = int(os.getenv("MAP_DELETE_BATCH_SIZE", "1000"))
+MAP_MAX_SIZE = int(os.getenv("MAP_MAX_SIZE", "500000"))  # Auto-purge oldest rows above this limit
+DB_BACKUP_INTERVAL_HOURS = int(os.getenv("DB_BACKUP_INTERVAL_HOURS", "1"))  # Auto-send DB backup every N hours
+MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
+WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
+WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
+FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "3600"))  # Cache join status for 1 hour default
+JOINED_STATUSES = ("member", "administrator", "creator", "owner", "restricted")
+FORCE_JOIN_REMINDER_COOLDOWN = int(os.getenv("FORCE_JOIN_REMINDER_COOLDOWN", "60"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN")
+if not DATABASE_URL:
+    raise RuntimeError("Missing DATABASE_URL")
+
+bot = telebot.TeleBot(BOT_TOKEN)
+broadcast_queue = queue.Queue(maxsize=BROADCAST_QUEUE_SIZE)
+media_groups = defaultdict(list)
+album_timers = {}
+last_album_time = {}
+album_lock = threading.Lock()
+activation_buffer = defaultdict(int)
+activation_timer = {}
+activation_lock = threading.Lock()
+db_pool = None
+receiver_cache_lock = threading.Lock()
+receiver_cache = []
+receiver_cache_at = 0.0
+pending_recovery_import = set()
+pending_fw_add = set()
+pending_fw_remove = set()
+pending_vip_add = set()
+pending_vip_remove = set()
+pending_fw_msg = set()
+pending_admin_broadcast = set()
+pending_admin_broadcast_target = {} # admin_id -> "active"|"inactive"|"pending"|"activation"|"all"
+pending_admin_setcaption = set()
+pending_admin_setwelcome = set()
+pending_admin_setinactive = set()
+pending_admin_setcontact = set()
+pending_admin_addforward = set()
+pending_admin_search_user = set()
+pending_admin_msg_target = {} # admin_id -> target_user_id
+pending_admin_set_note = {}   # admin_id -> target_user_id
+pending_admin_global_gift_data = {} # admin_id -> {"target": "all", "hours": 12}
+pending_name_change = set()  # user_id
+force_join_cache_lock = threading.Lock()
+force_join_cache = {}
+force_join_reminder_lock = threading.Lock()
+force_join_reminder_at = {}
+last_fw_msg_lock = threading.Lock()
+last_fw_msg = {}
+
+# =========================
+# ⚡ GLOBAL CACHE
+# =========================
+cache_lock = threading.Lock()
+cached_admins = set()
+cached_vips = set()
+cached_whitelisted = set()
+cached_force_join = False
+
+def refresh_caches():
+    global cached_force_join
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            # Refresh Admins
+            c.execute("SELECT user_id FROM admins")
+            new_admins = {row[0] for row in c.fetchall()}
+            
+            # Refresh VIPs
+            c.execute("SELECT user_id FROM vip_users")
+            new_vips = {row[0] for row in c.fetchall()}
+
+            # Refresh Whitelisted
+            c.execute("SELECT user_id FROM users WHERE whitelisted = TRUE")
+            new_whitelisted = {row[0] for row in c.fetchall()}
+            
+            # Refresh Force Join Status
+            c.execute("SELECT value FROM settings WHERE key='force_join_enabled'")
+            row = c.fetchone()
+            new_fj = bool(row and row[0] == "true")
+            
+    with cache_lock:
+        cached_admins.clear()
+        cached_admins.update(new_admins)
+        cached_vips.clear()
+        cached_vips.update(new_vips)
+        cached_whitelisted.clear()
+        cached_whitelisted.update(new_whitelisted)
+        cached_force_join = new_fj
+    
+    print(f"⚡ Cache refreshed: {len(cached_admins)} admins, {len(cached_vips)} VIPs, {len(cached_whitelisted)} whitelisted, Firewall: {'ON' if new_fj else 'OFF'}")
+
+# =========================
+# 🗄 DATABASE CONNECTION
+# =========================
+
+def init_db_pool():
+    global db_pool
+    if db_pool is None:
+        # Use ThreadedConnectionPool for multi-threaded stability
+        db_pool = pg_pool.ThreadedConnectionPool(
+            DB_POOL_MIN_CONN,
+            DB_POOL_MAX_CONN,
+            dsn=DATABASE_URL,
+        )
+
+
+@contextmanager
+def get_connection():
+    global db_pool
+    conn = None
+    use_pool = False
+    
+    try:
+        if db_pool is not None:
+            try:
+                conn = db_pool.getconn()
+                use_pool = True
+                # Quick health check for the connection
+                with conn.cursor() as c:
+                    c.execute("SELECT 1")
+            except Exception:
+                # Connection might be stale, try to get a fresh one or re-init
+                if conn:
+                    db_pool.putconn(conn, close=True)
+                init_db_pool()
+                conn = db_pool.getconn()
+                use_pool = True
+        else:
+            conn = psycopg2.connect(DATABASE_URL)
+            use_pool = False
+
+        yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if conn:
+            if use_pool:
+                db_pool.putconn(conn)
+            else:
+                conn.close()
+# =========================
+# 🧱 DATABASE INITIALIZATION
+# =========================
+
+def init_db():
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+
+            # =========================
+            # USERS TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT UNIQUE,
+                    banned BOOLEAN DEFAULT FALSE,
+                    auto_banned BOOLEAN DEFAULT FALSE,
+                    whitelisted BOOLEAN DEFAULT FALSE,
+                    activation_media_count INTEGER DEFAULT 0,
+                    total_media_sent INTEGER DEFAULT 0,
+                    last_activation_time BIGINT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS pending_join_requests (
+                    user_id BIGINT,
+                    chat_id TEXT,
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_users_total_media ON users(total_media_sent DESC)")
+
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS firewall_tracking (
+                    user_id BIGINT PRIMARY KEY,
+                    msg_received BOOLEAN DEFAULT FALSE,
+                    passed_ever BOOLEAN DEFAULT FALSE,
+                    currently_joined BOOLEAN DEFAULT FALSE
+                )
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS referred_by BIGINT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS joined_at BIGINT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS first_name TEXT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS last_name TEXT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS admin_notes TEXT
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS reputation TEXT DEFAULT 'Neutral',
+                ADD COLUMN IF NOT EXISTS tg_username TEXT
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS recovery_users (
+                    username TEXT PRIMARY KEY,
+                    banned BOOLEAN DEFAULT FALSE
+                )
+            """)
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS passed_firewall_ever BOOLEAN DEFAULT FALSE
+            """)
+
+            # =========================
+            # ADMINS TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS admins (
+                    user_id BIGINT PRIMARY KEY
+                )
+            """)
+
+            # =========================
+            # MESSAGE MAP TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS message_map (
+                    bot_message_id BIGINT,
+                    original_user_id BIGINT,
+                    original_message_id BIGINT,
+                    receiver_id BIGINT,
+                    created_at BIGINT
+                )
+            """)
+            c.execute("""
+                ALTER TABLE message_map
+                ADD COLUMN IF NOT EXISTS original_message_id BIGINT
+            """)
+            c.execute("CREATE INDEX IF NOT EXISTS idx_bot_msg ON message_map(bot_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_user ON message_map(original_user_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_msg ON message_map(original_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_pair ON message_map(original_user_id, original_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_created_at ON message_map(created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_receiver_bot_msg ON message_map(receiver_id, bot_message_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_original_pair_receiver ON message_map(original_user_id, original_message_id, receiver_id)")
+
+            # =========================
+            # ⚠ USER WARNINGS TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS user_warnings (
+                    user_id BIGINT PRIMARY KEY,
+                    warnings INTEGER DEFAULT 0,
+                    last_warning_time BIGINT
+                )
+            """)
+            c.execute("""
+                ALTER TABLE user_warnings
+                ADD COLUMN IF NOT EXISTS last_reason TEXT
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS force_join_channels (
+                    chat_id TEXT PRIMARY KEY
+                )
+            """)
+            c.execute("""
+                ALTER TABLE force_join_channels
+                ADD COLUMN IF NOT EXISTS button_name TEXT
+            """)
+            c.execute("""
+                ALTER TABLE force_join_channels
+                ADD COLUMN IF NOT EXISTS invite_link TEXT
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS vip_users (
+                    user_id BIGINT PRIMARY KEY
+                )
+            """)
+
+            # =========================
+            # BANNED WORDS TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS banned_words (
+                    word TEXT PRIMARY KEY
+                )
+            """)
+
+            # =========================
+            # SETTINGS TABLE
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS forward_targets (
+                    chat_id BIGINT PRIMARY KEY
+                )
+            """)
+
+            # Default Join Setting
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('join_open', 'true')
+                ON CONFLICT DO NOTHING
+            """)
+            # =========================
+            # 📦 DUPLICATE TRACKING
+            # =========================
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS media_duplicates (
+                    file_id TEXT PRIMARY KEY,
+                    first_sender BIGINT,
+                    duplicate_count INTEGER DEFAULT 0
+                )
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('welcome_message', '👋 Welcome!\n\nPlease drop your username:')
+                ON CONFLICT DO NOTHING
+            """)
+            
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('inactive_message', '⏳ You have been marked inactive.\nSend 12 media to reactivate.')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('contact_message', 'For support, please contact an administrator.')
+                ON CONFLICT DO NOTHING
+            """)
+
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('duplicate_filter', 'false')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('maintenance_mode', 'false')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('force_join_enabled', 'false')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('force_join_chat_id', '')
+                ON CONFLICT DO NOTHING
+            """)
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('force_join_message', '🚫 Please join our channel to use the bot.')
+                ON CONFLICT DO NOTHING
+            """)
+            # =========================
+            # FIRST ADMIN INIT
+            # =========================
+
+            first_admin = FIRST_ADMIN_ID
+
+            if first_admin:
+                try:
+                    first_admin = int(first_admin)
+
+                    c.execute("""
+                        INSERT INTO admins(user_id)
+                        VALUES(%s)
+                        ON CONFLICT DO NOTHING
+                    """, (first_admin,))
+
+                    print("First admin ensured.")
+
+                except Exception as e:
+                    print("Admin init error:", e)
+
+# =========================
+# 👤 USER EXISTENCE
+# =========================
+def delete_message_globally(receiver_id, bot_message_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT original_user_id, original_message_id
+                FROM message_map
+                WHERE receiver_id=%s AND bot_message_id=%s
+                LIMIT 1
+                """,
+                (receiver_id, bot_message_id),
+            )
+            key_row = c.fetchone()
+
+            if key_row and key_row[1] is not None:
+                original_user_id, original_message_id = key_row
+                c.execute(
+                    """
+                    DELETE FROM message_map
+                    WHERE original_user_id=%s AND original_message_id=%s
+                    RETURNING receiver_id, bot_message_id
+                    """,
+                    (original_user_id, original_message_id),
+                )
+                rows = c.fetchall()
+            else:
+                # Fallback for very old rows saved before original_message_id existed.
+                c.execute(
+                    """
+                    DELETE FROM message_map
+                    WHERE bot_message_id=%s
+                    RETURNING receiver_id, bot_message_id
+                    """,
+                    (bot_message_id,),
+                )
+                rows = c.fetchall()
+
+    deleted_count = 0
+    for target_receiver_id, target_bot_msg_id in rows:
+        try:
+            bot.delete_message(target_receiver_id, target_bot_msg_id)
+            deleted_count += 1
+        except:
+            pass
+
+    return deleted_count
+def purge_user_messages(user_id):
+
+    total_deleted = 0
+    while True:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    """
+                    WITH batch AS (
+                        SELECT ctid, bot_message_id, receiver_id
+                        FROM message_map
+                        WHERE original_user_id=%s
+                        LIMIT %s
+                    )
+                    DELETE FROM message_map
+                    USING batch
+                    WHERE message_map.ctid = batch.ctid
+                    RETURNING batch.bot_message_id, batch.receiver_id
+                    """,
+                    (user_id, MAP_DELETE_BATCH_SIZE),
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            break
+
+        for bot_msg_id, target_receiver_id in rows:
+            try:
+                bot.delete_message(target_receiver_id, bot_msg_id)
+                total_deleted += 1
+            except:
+                pass
+    return total_deleted
+
+def purge_all_user_messages():
+
+    deleted_count = 0
+    while True:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    """
+                    WITH batch AS (
+                        SELECT ctid, bot_message_id, receiver_id
+                        FROM message_map
+                        LIMIT %s
+                    )
+                    DELETE FROM message_map
+                    USING batch
+                    WHERE message_map.ctid = batch.ctid
+                    RETURNING batch.bot_message_id, batch.receiver_id
+                    """,
+                    (MAP_DELETE_BATCH_SIZE,),
+                )
+                rows = c.fetchall()
+
+        if not rows:
+            break
+
+        for bot_msg_id, receiver_id in rows:
+            try:
+                bot.delete_message(receiver_id, bot_msg_id)
+                deleted_count += 1
+            except:
+                pass
+
+    return deleted_count
+
+def get_original_sender(bot_message_id, receiver_id=None):
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if receiver_id is not None:
+                c.execute(
+                    """
+                    SELECT original_user_id
+                    FROM message_map
+                    WHERE bot_message_id=%s AND receiver_id=%s
+                    LIMIT 1
+                    """,
+                    (bot_message_id, receiver_id),
+                )
+            else:
+                c.execute(
+                    """
+                    SELECT original_user_id
+                    FROM message_map
+                    WHERE bot_message_id=%s
+                    LIMIT 1
+                    """,
+                    (bot_message_id,),
+                )
+            row = c.fetchone()
+
+    return row[0] if row else None
+
+def user_exists(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT 1 FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            return c.fetchone() is not None
+def set_referred_by(user_id, referrer_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users
+                SET referred_by = %s
+                WHERE user_id=%s AND referred_by IS NULL
+            """, (referrer_id, user_id))
+
+def add_referral_bonus(user_id):
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT last_activation_time FROM users WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            if not row:
+                return
+            last_time = row[0]
+            
+            if last_time is None or last_time < now - get_inactivity_limit():
+                new_last_time = now - get_inactivity_limit() + 3600
+            else:
+                new_last_time = last_time + 3600
+                
+            c.execute("""
+                UPDATE users
+                SET last_activation_time = %s,
+                    auto_banned = FALSE
+                WHERE user_id=%s
+            """, (new_last_time, user_id))
+def add_user(user_id, first_name=None, last_name=None, tg_username=None):
+    now = int(time.time())
+    grace_seconds = get_new_user_grace_hours() * 3600
+    free_activation_time = now - get_inactivity_limit() + grace_seconds
+    
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO users(user_id, last_activation_time, joined_at, first_name, last_name, tg_username)
+                VALUES(%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    joined_at = COALESCE(users.joined_at, EXCLUDED.joined_at),
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    tg_username = EXCLUDED.tg_username
+            """, (user_id, free_activation_time, now, first_name, last_name, tg_username))
+
+def grant_full_cycle(user_id):
+    now = int(time.time())
+    limit = get_inactivity_limit()
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT last_activation_time FROM users WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            if not row:
+                return
+            last_time = row[0]
+            
+            # If inactive, set to now (full cycle starts now)
+            if last_time is None or last_time < now - limit:
+                new_last_time = now
+            else:
+                # If active, add the full limit to existing time
+                new_last_time = last_time + limit
+                
+            c.execute("""
+                UPDATE users
+                SET last_activation_time = %s,
+                    auto_banned = FALSE
+                WHERE user_id=%s
+            """, (new_last_time, user_id))
+
+def grant_global_free_cycle(target="all", hours=12):
+    now = int(time.time())
+    limit = get_inactivity_limit()
+    
+    # bonus_seconds = how much time we are adding
+    bonus_seconds = hours * 3600
+    
+    # Determine the WHERE clause based on target
+    where_clause = ""
+    if target == "senders":
+        where_clause = " AND total_media_sent > 0"
+    elif target == "non_senders":
+        where_clause = " AND total_media_sent = 0"
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            # Step 1: Reactivate Inactive (those who have expired)
+            # We set them up so they have 'bonus_seconds' remaining from 'now'
+            new_inactive_time = now - limit + bonus_seconds
+            
+            c.execute(f"""
+                UPDATE users
+                SET last_activation_time = %s,
+                    auto_banned = FALSE
+                WHERE (last_activation_time IS NULL OR last_activation_time < %s)
+                {where_clause}
+            """, (new_inactive_time, now - limit))
+            
+            # Step 2: Extend Active (those who still have time)
+            c.execute(f"""
+                UPDATE users
+                SET last_activation_time = last_activation_time + %s
+                WHERE last_activation_time >= %s
+                {where_clause}
+            """, (bonus_seconds, now - limit))
+
+# =========================
+# 🏷 USERNAME HELPERS
+# =========================
+
+def get_username(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT username FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row[0] if row else None
+
+
+def set_username(user_id, username):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users
+                SET username=%s
+                WHERE user_id=%s
+            """, (username.lower(), user_id))
+
+
+def username_taken(username):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT 1 FROM users WHERE username=%s",
+                (username.lower(),)
+            )
+            return c.fetchone() is not None
+
+
+def get_recovery_ban_for_username(username):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT banned FROM recovery_users WHERE username=%s",
+                (username.lower(),),
+            )
+            row = c.fetchone()
+            return bool(row and row[0])
+
+
+def export_recovery_payload():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                SELECT username, banned, first_name, last_name, admin_notes, reputation
+                FROM users
+                WHERE username IS NOT NULL
+                ORDER BY username
+                """
+            )
+            users = [{
+                "username": r[0],
+                "banned": bool(r[1]),
+                "first_name": r[2],
+                "last_name": r[3],
+                "admin_notes": r[4],
+                "reputation": r[5]
+            } for r in c.fetchall()]
+            c.execute("SELECT word FROM banned_words ORDER BY word")
+            words = [r[0] for r in c.fetchall()]
+    return {
+        "version": 1,
+        "exported_at": int(time.time()),
+        "users": users,
+        "banned_words": words,
+    }
+
+
+def import_recovery_payload(payload):
+    users = payload.get("users", [])
+    words = payload.get("banned_words", [])
+
+    imported_users = 0
+    imported_words = 0
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            for item in users:
+                username = str(item.get("username", "")).strip().lower()
+                if not username: continue
+                banned = bool(item.get("banned", False))
+                fname = item.get("first_name")
+                lname = item.get("last_name")
+                notes = item.get("admin_notes")
+                rep = item.get("reputation", "Neutral")
+
+                c.execute("""
+                    INSERT INTO recovery_users (username, banned)
+                    VALUES (%s, %s)
+                    ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
+                """, (username, banned))
+
+                # Update main users table if they exist
+                c.execute("""
+                    UPDATE users
+                    SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
+                    WHERE username = %s
+                """, (banned, fname, lname, notes, rep, username))
+                imported_users += 1
+
+            for word in words:
+                clean_word = str(word).strip().lower()
+                if not clean_word:
+                    continue
+                c.execute(
+                    "INSERT INTO banned_words(word) VALUES(%s) ON CONFLICT DO NOTHING",
+                    (clean_word,),
+                )
+                imported_words += 1
+
+            c.execute(
+                """
+                UPDATE users u
+                SET banned = r.banned
+                FROM recovery_users r
+                WHERE u.username = r.username
+                """
+            )
+
+    return imported_users, imported_words
+# =========================
+# 👑 ADMIN HELPERS
+# =========================
+
+def is_admin(user_id):
+    with cache_lock:
+        if user_id in cached_admins:
+            return True
+    # Fallback to DB if cache seems empty or for extra safety (though refresh_caches should handle it)
+    if not cached_admins:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT 1 FROM admins WHERE user_id=%s",
+                    (user_id,)
+                )
+                return c.fetchone() is not None
+    return False
+
+
+def should_store_mapping(sender_id, receivers=None):
+    if MESSAGE_MAP_MODE == "off":
+        return False
+    
+    if MESSAGE_MAP_MODE == "admin_only":
+        # Always store if an admin is the sender or if any receiver is an admin
+        # Or if there are log groups (extra targets)
+        with cache_lock:
+            if sender_id in cached_admins:
+                return True
+            if receivers:
+                if any(uid in cached_admins for uid in receivers):
+                    return True
+        # If we have any forward targets (log groups), we usually want mapping
+        if get_forward_targets():
+            return True
+        return False
+    return True
+
+
+def add_admin(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO admins(user_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+            """, (user_id,))
+    with cache_lock:
+        cached_admins.add(user_id)
+
+
+def remove_admin(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM admins WHERE user_id=%s",
+                (user_id,)
+            )
+    with cache_lock:
+        cached_admins.discard(user_id)
+
+def add_forward_target(chat_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO forward_targets(chat_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (chat_id,),
+            )
+
+
+def get_forward_targets():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT chat_id FROM forward_targets")
+            return [row[0] for row in c.fetchall()]
+
+def build_prefix(user_id):
+
+    username = get_username(user_id)
+
+    if username:
+        return f"{username}~\n"
+
+    return "👤 Unknown\n"
+
+# =========================
+# 🚫 BAN HELPERS
+# =========================
+
+def is_banned(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT banned FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row and row[0]
+
+
+def ban_user(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET banned=TRUE WHERE user_id=%s",
+                (user_id,)
+            )
+
+
+def unban_user(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET banned=FALSE WHERE user_id=%s",
+                (user_id,)
+            )
+# =========================
+# ⚠ WARNING HELPERS
+# =========================
+
+def get_warning_details(user_id):
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT warnings, last_warning_time, last_reason FROM user_warnings WHERE user_id=%s",
+                (user_id,),
+            )
+            row = c.fetchone()
+            if not row:
+                return 0, "No warning reason recorded."
+            warnings, last_warning_time, last_reason = row
+            if last_warning_time and (now - last_warning_time) > WARNING_EXPIRY:
+                c.execute(
+                    "DELETE FROM user_warnings WHERE user_id=%s",
+                    (user_id,),
+                )
+                return 0, "No warning reason recorded."
+            return warnings, (last_reason or "No warning reason recorded.")
+
+
+def get_warnings(user_id):
+    return get_warning_details(user_id)[0]
+
+
+def add_warning(user_id, reason="No reason provided"):
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT warnings, last_warning_time FROM user_warnings WHERE user_id=%s",
+                (user_id,),
+            )
+            row = c.fetchone()
+
+            if row:
+                current_warnings, last_warning_time = row
+                if last_warning_time and (now - last_warning_time) > WARNING_EXPIRY:
+                    c.execute(
+                        """
+                        INSERT INTO user_warnings(user_id, warnings, last_warning_time, last_reason)
+                        VALUES(%s, 1, %s, %s)
+                        ON CONFLICT (user_id)
+                        DO UPDATE SET
+                            warnings = 1,
+                            last_warning_time = EXCLUDED.last_warning_time,
+                            last_reason = EXCLUDED.last_reason
+                        RETURNING warnings
+                        """,
+                        (user_id, now, reason),
+                    )
+                    return c.fetchone()[0]
+                if last_warning_time and (now - last_warning_time) < WARNING_COOLDOWN:
+                    return current_warnings
+
+            c.execute(
+                """
+                INSERT INTO user_warnings(user_id, warnings, last_warning_time, last_reason)
+                VALUES(%s, 1, %s, %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET
+                    warnings = user_warnings.warnings + 1,
+                    last_warning_time = EXCLUDED.last_warning_time,
+                    last_reason = EXCLUDED.last_reason
+                RETURNING warnings
+                """,
+                (user_id, now, reason),
+            )
+            return c.fetchone()[0]
+
+
+def reset_warnings(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM user_warnings WHERE user_id=%s",
+                (user_id,),
+            )
+
+
+def warning_action_for_count(warnings):
+    if warnings >= MAX_WARNINGS:
+        return "ban"
+    if warnings == max(1, MAX_WARNINGS - 1):
+        return "restrict"
+    return "warn"
+# =========================
+# ⭐ WHITELIST HELPERS
+# =========================
+
+def is_whitelisted(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT whitelisted FROM users WHERE user_id=%s",
+                (user_id,)
+            )
+            row = c.fetchone()
+            return row and row[0]
+
+
+def whitelist_user(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET whitelisted=TRUE WHERE user_id=%s",
+                (user_id,)
+            )
+    try:
+        bot.send_message(
+            user_id,
+            "⭐ You have been whitelisted!\nYou now have full access."
+        )
+    except Exception:
+        pass
+
+
+def remove_whitelist(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET whitelisted=FALSE WHERE user_id=%s",
+                (user_id,)
+            )
+# =========================
+# 🚪 JOIN CONTROL
+# =========================
+
+def is_join_open():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='join_open'"
+            )
+            row = c.fetchone()
+            return row and row[0] == "true"
+
+
+def set_join_status(status: bool):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='join_open'
+            """, ("true" if status else "false",))
+
+
+def is_maintenance_mode():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='maintenance_mode'")
+            row = c.fetchone()
+            return row and row[0] == "true"
+
+def get_maintenance_message():
+    return "🚧 *System Maintenance* 🚧\n\nThe bot is currently undergoing scheduled maintenance to improve performance. Please check back in a few minutes.\n\nThank you for your patience! 🙏"
+
+def set_maintenance_mode(status: bool):
+    val = "true" if status else "false"
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO settings (key, value)
+                VALUES ('maintenance_mode', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (val,))
+
+def get_media_caption():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='media_caption'")
+            row = c.fetchone()
+            return row[0] if row else None
+
+def set_media_caption(caption_text: str):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if not caption_text:
+                c.execute("DELETE FROM settings WHERE key='media_caption'")
+            else:
+                c.execute(
+                    """
+                    INSERT INTO settings(key, value)
+                    VALUES('media_caption', %s)
+                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                    """,
+                    (caption_text,)
+                )
+
+
+def _normalize_force_join_chat(raw_value):
+    if raw_value is None:
+        return None
+    value = str(raw_value).strip()
+    if not value:
+        return None
+
+    # Handle private invite links and internal links that shouldn't be normalized to @usernames
+    if any(x in value for x in ["t.me/+", "t.me/joinchat/", "t.me/c/", "/joinchat/"]):
+        return value
+
+    # Public link -> convert to @username.
+    if "t.me/" in value:
+        slug = value.split("t.me/", 1)[1].split("?", 1)[0].strip("/")
+        if slug and "/" not in slug: # only @username if it's a simple slug
+            return f"@{slug}"
+        return value
+
+    if value.startswith("@"):
+        return value
+
+    return value
+
+
+def _clear_force_join_cache():
+    with force_join_cache_lock:
+        force_join_cache.clear()
+
+
+def is_force_join_enabled():
+    with cache_lock:
+        return cached_force_join
+
+
+def get_force_join_channels():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT chat_id, button_name, invite_link FROM force_join_channels ORDER BY chat_id")
+            rows = c.fetchall()
+            channels = []
+            for raw_chat_id, raw_button_name, raw_invite_link in rows:
+                normalized = _normalize_force_join_chat(raw_chat_id)
+                if normalized:
+                    channels.append({
+                        "chat_id": str(normalized),
+                        "name": (raw_button_name.strip() if raw_button_name else str(normalized)),
+                        "invite_link": (raw_invite_link.strip() if raw_invite_link else None),
+                    })
+
+            # Backward compatibility with legacy single-channel setting.
+            if not channels:
+                c.execute("SELECT value FROM settings WHERE key='force_join_chat_id'")
+                legacy = c.fetchone()
+                legacy_chat = _normalize_force_join_chat(legacy[0] if legacy else None)
+                if legacy_chat:
+                    channels.append({
+                        "chat_id": str(legacy_chat),
+                        "name": str(legacy_chat),
+                        "invite_link": None,
+                    })
+            return channels
+
+
+def get_force_join_chat():
+    channels = get_force_join_channels()
+    return channels[0]["chat_id"] if channels else None
+
+
+def add_force_channel(chat_id, button_name=None, invite_link=None):
+    normalized = _normalize_force_join_chat(chat_id)
+    if not normalized:
+        return False
+    if not button_name:
+        button_name = str(chat_id)
+    invite_link = invite_link.strip() if isinstance(invite_link, str) and invite_link.strip() else None
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO force_join_channels(chat_id, button_name, invite_link)
+                VALUES(%s, %s, %s)
+                ON CONFLICT (chat_id)
+                DO UPDATE SET
+                    button_name=EXCLUDED.button_name,
+                    invite_link=COALESCE(EXCLUDED.invite_link, force_join_channels.invite_link)
+                """,
+                (str(normalized), button_name, invite_link),
+            )
+    _clear_force_join_cache()
+    return True
+
+
+def remove_force_channel(chat_id):
+    normalized = _normalize_force_join_chat(chat_id)
+    if not normalized:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM force_join_channels WHERE chat_id=%s",
+                (str(normalized),),
+            )
+    _clear_force_join_cache()
+
+
+def get_force_join_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='force_join_message'")
+            row = c.fetchone()
+            return row[0] if row and row[0] else "🚫 Please join our channel to use the bot."
+
+
+def set_force_join_message(message):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_message', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (message,),
+            )
+
+
+def get_view_files_chat_id():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT value FROM settings WHERE key='view_files_chat_id'")
+            row = c.fetchone()
+            return row[0] if row else None
+
+
+def set_view_files_chat_id(chat_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO settings(key, value)
+                VALUES('view_files_chat_id', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """, (str(chat_id) if chat_id else None,))
+
+
+def set_force_join(chat_id, message):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_chat_id', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (str(chat_id).strip(),),
+            )
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_message', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                (message,),
+            )
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_enabled', 'true')
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """
+            )
+    refresh_caches()
+    _clear_force_join_cache()
+    add_force_channel(chat_id)
+
+
+def disable_force_join():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('force_join_enabled', 'false')
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """
+            )
+    refresh_caches()
+    _clear_force_join_cache()
+
+
+def is_vip(user_id):
+    with cache_lock:
+        if user_id in cached_vips:
+            return True
+    if not cached_vips:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT 1 FROM vip_users WHERE user_id=%s",
+                    (user_id,),
+                )
+                return c.fetchone() is not None
+    return False
+
+
+def add_vip(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO vip_users(user_id)
+                VALUES(%s)
+                ON CONFLICT DO NOTHING
+                """,
+                (user_id,),
+            )
+    with cache_lock:
+        cached_vips.add(user_id)
+    _clear_force_join_cache()
+
+
+def remove_vip(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "DELETE FROM vip_users WHERE user_id=%s",
+                (user_id,),
+            )
+    with cache_lock:
+        cached_vips.discard(user_id)
+    _clear_force_join_cache()
+
+
+def _force_join_link(chat_ref):
+    if isinstance(chat_ref, str):
+        clean = chat_ref.strip()
+        if clean.startswith("@"):
+            return f"https://t.me/{clean[1:]}"
+        if clean.startswith("https://t.me/") or clean.startswith("http://t.me/"):
+            return clean
+    return None
+
+
+def parse_force_channel_input(text):
+    parts = [p.strip() for p in str(text).split(" - ")]
+    parts = [p for p in parts if p]
+    if len(parts) >= 3:
+        name = parts[0]
+        chat_id = parts[1]
+        invite_link = parts[2]
+        return name, chat_id, invite_link
+    if len(parts) == 2:
+        name = parts[0]
+        chat_id = parts[1]
+        return name, chat_id, None
+    if len(parts) == 1:
+        token = parts[0]
+        return token, token, None
+    return None, None, None
+
+
+def is_user_joined_detailed(user_id, force_refresh=False):
+    if is_admin(user_id) or is_vip(user_id) or is_whitelisted(user_id):
+        return True, []
+
+    channels = get_force_join_channels()
+    if not channels:
+        return True, []
+
+    now = time.time()
+    channels_key = tuple(str(ch.get("chat_id")) for ch in channels)
+    cache_key = (channels_key, int(user_id))
+
+    if not force_refresh:
+        # 1. Check Memory Cache
+        with force_join_cache_lock:
+            cached = force_join_cache.get(cache_key)
+            if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
+                return cached[0], []
+        
+        # 2. Check Database Cache (More persistent than memory)
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT currently_joined FROM firewall_tracking WHERE user_id=%s", (user_id,))
+                    row = c.fetchone()
+                    if row and row[0]:
+                        # Update memory cache from DB
+                        with force_join_cache_lock:
+                            force_join_cache[cache_key] = (True, now)
+                        return True, []
+        except Exception as e:
+            print(f"Firewall DB check error: {e}")
+
+    # Get all pending join requests for this user at once
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT chat_id FROM pending_join_requests WHERE user_id=%s", (user_id,))
+            pending_chats = {row[0] for row in c.fetchall()}
+
+    channels_to_check = []
+    missing_channels = []
+
+    for channel in channels:
+        chat_id = str(channel.get("chat_id", "")).strip()
+        c_name = str(channel.get("name") or chat_id)
+        if not chat_id:
+            continue
+            
+        # Treat as joined if request is pending (numeric or username)
+        if chat_id in pending_chats:
+            continue
+            
+        # Fail closed on non-verifiable links
+        if any(x in chat_id for x in ["t.me/+", "t.me/joinchat/", "/joinchat/", "t.me/c/"]):
+            missing_channels.append(f"{c_name} (⚠️ Bot Misconfigured)")
+            continue
+            
+        channels_to_check.append(channel)
+
+    if channels_to_check:
+        def check_channel(channel):
+            c_id = str(channel.get("chat_id")).strip()
+            c_name = str(channel.get("name") or c_id)
+            c_ref = int(c_id) if c_id.lstrip("-").isdigit() else c_id
+            
+            try:
+                member = bot.get_chat_member(c_ref, user_id)
+                if member.status in JOINED_STATUSES:
+                    return None
+                return c_name
+            except Exception as e:
+                # Provide the exact error for debugging
+                err_msg = str(e).replace("A request to the Telegram API was unsuccessful. Error code: 400. Description: ", "")
+                print(f"Firewall API Error for {c_id}: {e}")
+                return f"{c_name} (⚠️ Error: {err_msg})"
+
+        # Use parallel checks to avoid sequential network delays
+        with ThreadPoolExecutor(max_workers=len(channels_to_check)) as executor:
+            results = list(executor.map(check_channel, channels_to_check))
+            
+        for res in results:
+            if res is not None:
+                missing_channels.append(res)
+                
+    joined = len(missing_channels) == 0
+
+    # Sync with database tracking table for relay accuracy
+    if joined:
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
+                    VALUES (%s, TRUE, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE SET currently_joined = TRUE
+                """, (user_id,))
+                
+                # Update main users table for historical stats
+                c.execute("UPDATE users SET passed_firewall_ever = TRUE WHERE user_id = %s", (user_id,))
+
+
+    with force_join_cache_lock:
+        force_join_cache[cache_key] = (joined, now)
+
+    return joined, missing_channels
+
+def is_user_joined(user_id, force_refresh=False):
+    return is_user_joined_detailed(user_id, force_refresh)[0]
+
+
+def can_send_force_join_reminder(user_id):
+    now = time.time()
+    with force_join_reminder_lock:
+        last = force_join_reminder_at.get(int(user_id), 0.0)
+        if (now - last) < FORCE_JOIN_REMINDER_COOLDOWN:
+            return False
+        force_join_reminder_at[int(user_id)] = now
+        return True
+
+
+def send_force_join_ui(user_id, prefix_text=None):
+    message = get_force_join_message()
+    if prefix_text:
+        message = f"{prefix_text}\n\n{message}"
+    
+    channels = get_force_join_channels()
+
+    markup = InlineKeyboardMarkup()
+    for ch in channels:
+        join_link = ch.get("invite_link") or _force_join_link(ch.get("chat_id"))
+        if join_link:
+            label = str(ch.get("name") or ch.get("chat_id"))
+            markup.add(
+                InlineKeyboardButton(f"📢 {label}", url=join_link)
+            )
+
+    markup.add(
+        InlineKeyboardButton("✅ I Joined", callback_data="check_join")
+    )
+
+    with last_fw_msg_lock:
+        previous_id = last_fw_msg.get(int(user_id))
+
+    if previous_id:
+        try:
+            bot.edit_message_text(
+                message,
+                chat_id=user_id,
+                message_id=previous_id,
+                reply_markup=markup
+            )
+            return
+        except Exception:
+            with last_fw_msg_lock:
+                last_fw_msg.pop(int(user_id), None)
+
+    sent = bot.send_message(
+        user_id,
+        message,
+        reply_markup=markup
+    )
+    with last_fw_msg_lock:
+        last_fw_msg[int(user_id)] = sent.message_id
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO firewall_tracking (user_id, msg_received)
+                VALUES (%s, TRUE)
+                ON CONFLICT (user_id) DO UPDATE SET msg_received = TRUE
+            """, (user_id,))
+
+
+def clear_force_join_ui(user_id):
+    with last_fw_msg_lock:
+        msg_id = last_fw_msg.pop(int(user_id), None)
+    if not msg_id:
+        return
+    try:
+        bot.delete_message(user_id, msg_id)
+    except Exception:
+        pass
+# =========================
+# 🧠 USER STATE RESOLVER
+# =========================
+
+def get_user_state(user_id):
+
+    if is_admin(user_id):
+        return "ADMIN"
+
+    if is_banned(user_id):
+        return "BANNED"
+
+    if is_whitelisted(user_id):
+        return "ACTIVE"
+
+    username = get_username(user_id)
+
+    if username is None:
+        return "NO_USERNAME"
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT last_activation_time
+                FROM users
+                WHERE user_id=%s
+            """, (user_id,))
+            row = c.fetchone()
+
+    if not row:
+        return "JOINING"
+
+    last_activation_time = row[0]
+
+    if last_activation_time is None:
+        return "JOINING"
+
+    if last_activation_time < int(time.time()) - get_inactivity_limit():
+        return "INACTIVE"
+
+    return "ACTIVE"
+# =========================
+# 📊 GET ACTIVATION DATA
+# =========================
+
+def get_activation_data(user_id):
+    """
+    Returns:
+        activation_media_count,
+        total_media_sent,
+        auto_banned,
+        last_activation_time
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT activation_media_count,
+                       total_media_sent,
+                       auto_banned,
+                       last_activation_time
+                FROM users
+                WHERE user_id=%s
+            """, (user_id,))
+            return c.fetchone()
+# =========================
+# 📈 INCREMENT MEDIA
+# =========================
+
+def increment_media(user_id, amount=1):
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users
+                SET activation_media_count = activation_media_count + %s,
+                    total_media_sent = total_media_sent + %s
+                WHERE user_id=%s
+            """, (amount, amount, user_id))
+#========================
+#wellcome msg by admin helper
+#========================   
+def get_welcome_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='welcome_message'"
+            )
+            row = c.fetchone()
+            return row[0] if row else "👋 Welcome!"
+
+def set_welcome_message(text):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='welcome_message'
+            """, (text,))
+
+def get_contact_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='contact_message'"
+            )
+            row = c.fetchone()
+            return row[0] if row else "For support, please contact an administrator."
+
+def set_contact_message(text):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='contact_message'
+            """, (text,))
+
+def get_inactive_message():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='inactive_message'"
+            )
+            row = c.fetchone()
+            return row[0] if row else "⏳ You have been marked inactive.\nSend 12 media to reactivate."
+
+def set_inactive_message(text):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='inactive_message'
+            """, (text,))
+# =========================
+# 🔄 ACTIVATE USER
+# =========================
+
+def activate_user(user_id):
+
+    now = int(time.time())
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users
+                SET activation_media_count = 0,
+                    auto_banned = FALSE,
+                    last_activation_time = %s
+                WHERE user_id=%s
+            """, (now, user_id))
+# =========================
+# ✅ CHECK ACTIVATION
+# =========================
+
+def check_activation(user_id):
+
+    data = get_activation_data(user_id)
+
+    if not data:
+        return False
+
+    activation_count, _, _, _ = data
+
+    if activation_count >= REQUIRED_MEDIA:
+        activate_user(user_id)
+        return True
+
+    return False
+# =========================
+# ⏳ AUTO INACTIVITY CHECK
+# =========================
+
+def auto_ban_inactive_users():
+
+    limit = int(time.time()) - get_inactivity_limit()
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users
+                SET auto_banned = TRUE,
+                    activation_media_count = 0
+                WHERE auto_banned = FALSE
+                  AND last_activation_time IS NOT NULL
+                  AND last_activation_time < %s
+                RETURNING user_id
+            """, (limit,))
+            rows = c.fetchall()
+            
+    if rows:
+        msg = get_inactive_message()
+        for r in rows:
+            user_id = r[0]
+            try:
+                bot.send_message(user_id, msg)
+            except Exception:
+                pass
+            
+def is_duplicate_filter_enabled():
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT value FROM settings WHERE key='duplicate_filter'"
+            )
+            row = c.fetchone()
+            return row and row[0] == "true"
+
+
+def set_duplicate_filter(status: bool):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE settings
+                SET value=%s
+                WHERE key='duplicate_filter'
+            """, ("true" if status else "false",))
+
+
+def check_and_register_duplicate(file_id, sender_id):
+    """
+    Returns True if duplicate
+    Returns False if first time
+    """
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+
+            c.execute(
+                "SELECT 1 FROM media_duplicates WHERE file_id=%s",
+                (file_id,)
+            )
+            exists = c.fetchone()
+
+            if exists:
+                c.execute("""
+                    UPDATE media_duplicates
+                    SET duplicate_count = duplicate_count + 1
+                    WHERE file_id=%s
+                """, (file_id,))
+                return True
+
+            else:
+                c.execute("""
+                    INSERT INTO media_duplicates(file_id, first_sender)
+                    VALUES(%s, %s)
+                """, (file_id, sender_id))
+                return False
+# =========================
+# 🚪 START COMMAND
+# =========================
+
+@bot.message_handler(commands=['start'])
+def start_command(message):
+
+    user_id = message.chat.id
+
+    parts = message.text.split()
+    referrer_id = None
+    if len(parts) > 1:
+        try:
+            referrer_id = int(parts[1])
+        except ValueError:
+            pass
+
+    if is_maintenance_mode() and not is_admin(user_id):
+        bot.send_message(user_id, "Bot is under maintenance. Try again later.")
+        return
+
+    # 🚫 Manual Ban
+    if is_banned(user_id):
+        bot.send_message(user_id, "🚫 You are banned.")
+        return
+
+    # 👑 Admin Auto Registration
+    if is_admin(user_id):
+        add_user(user_id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
+        if get_username(user_id) is None:
+            set_username(user_id, "admin")
+        bot.send_message(user_id, "👑 Admin access granted.")
+        return
+
+    # 🛡️ Force Join Check (Firewall)
+    if is_force_join_enabled():
+        joined = is_user_joined(user_id)
+        if not joined:
+            joined = is_user_joined(user_id, force_refresh=True)
+        if not joined:
+            send_force_join_ui(user_id)
+            return
+
+    # 🆕 New User
+    if not user_exists(user_id):
+
+        if not is_join_open():
+            bot.send_message(
+                user_id,
+                "🚪 Joining is currently closed."
+            )
+            return
+
+        add_user(user_id, message.from_user.first_name, message.from_user.last_name)
+
+        if referrer_id and referrer_id != user_id and user_exists(referrer_id):
+            set_referred_by(user_id, referrer_id)
+            add_referral_bonus(referrer_id)
+            try:
+                bot.send_message(
+                    referrer_id,
+                    "🎉 Someone joined using your referral link! You earned 1 hour of free activity time."
+                )
+            except:
+                pass
+
+    # Update TG Username if changed
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("UPDATE users SET tg_username=%s, first_name=%s, last_name=%s WHERE user_id=%s", 
+                      (message.from_user.username, message.from_user.first_name, message.from_user.last_name, user_id))
+
+    # 🏷 Ask Username If Not Set
+    if get_username(user_id) is None:
+        bot.send_message(
+            user_id,
+            get_welcome_message()
+        )
+        
+        return
+
+    # 🧠 Show Current State
+    state = get_user_state(user_id)
+
+    if state == "JOINING":
+        bot.send_message(
+            user_id,
+            f"🔒 Send {REQUIRED_MEDIA} media to join."
+        )
+
+    elif state == "INACTIVE":
+        bot.send_message(
+            user_id,
+            f"⏳ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
+        )
+
+    else:
+        bot.send_message(user_id, "👋 Welcome back!")
+@bot.message_handler(commands=['referral'])
+def referral_command(message):
+    user_id = message.chat.id
+
+    # 🚫 Restriction checks (important)
+    if is_banned(user_id):
+        bot.send_message(user_id, "🚫 You are banned.")
+        return
+
+    if get_username(user_id) is None:
+        bot.send_message(user_id, "⚠️ Set username first using /start.")
+        return
+
+    try:
+        bot_info = bot.get_me()
+
+        # 🔗 Generate referral link
+        ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+
+        # 📊 Optional: count referrals (bonus improvement)
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT COUNT(*) FROM users WHERE referred_by=%s",
+                    (user_id,)
+                )
+                count = c.fetchone()[0]
+
+        bot.send_message(
+            user_id,
+            f"🔗 Your referral link:\n{ref_link}\n\n"
+            f"👥 Total referrals: {count}\n\n"
+            "🎁 Earn 1 hour of activity time for each user who joins using your link!"
+        )
+
+    except Exception as e:
+        print("Referral error:", e)
+        bot.send_message(user_id, "⚠️ Failed to generate referral link. Try again later.")
+
+@bot.message_handler(commands=['setname', 'changename'])
+def set_name_cmd(message):
+    user_id = message.chat.id
+    if is_banned(user_id):
+        return
+        
+    pending_name_change.add(user_id)
+    current_name = get_username(user_id)
+    msg = "📝 *Change Bot Display Name*\n\n"
+    if current_name:
+        msg += f"Current Name: `{current_name}`\n\n"
+    msg += "Please send your *new name* (3-20 characters, no spaces)."
+    
+    bot.send_message(user_id, msg, parse_mode="Markdown")
+
+# =========================
+# 🏷 USERNAME CAPTURE
+# =========================
+
+@bot.message_handler(
+    func=lambda m: get_username(m.chat.id) is None or m.chat.id in pending_name_change,
+    content_types=['text']
+)
+def capture_username(message):
+
+    user_id = message.chat.id
+    username = message.text.strip().lower()
+
+    # Prevent commands being treated as username
+    if username.startswith('/'):
+        return
+
+    if len(username) < 3 or len(username) > 20:
+        bot.send_message(user_id, "Name must be between 3 and 20 characters. Try again.")
+        return
+
+    if username_taken(username):
+        bot.send_message(user_id, "Username already taken. Try another.")
+        return
+
+    set_username(user_id, username)
+    if user_id in pending_name_change:
+        pending_name_change.remove(user_id)
+        
+    if get_recovery_ban_for_username(username):
+        ban_user(user_id)
+        bot.send_message(user_id, "Username recovered from backup with banned status.")
+        return
+
+    bot.send_message(
+        user_id,
+        f"✅ {username} set.\nnow you can use this bot.."
+
+    )
+# =========================
+# 🚫 BANNED WORD CHECK
+# =========================
+
+def contains_banned_word(text):
+
+    if not text:
+        return False
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT word FROM banned_words")
+            words = [row[0] for row in c.fetchall()]
+
+    text = text.lower()
+
+    for word in words:
+        if word in text:
+            return True
+
+    return False
+# =========================
+# 🔒 HANDLE RESTRICTIONS
+# =========================
+
+def handle_restrictions(message):
+
+    user_id = message.chat.id
+    state = get_user_state(user_id)
+
+    # 👑 Admin/VIP/Whitelist Bypass (Global)
+    if state == "ADMIN" or is_vip(user_id) or is_whitelisted(user_id):
+        return False
+
+    # 🛡️ Force Join Check (Firewall)
+    if is_force_join_enabled():
+        if not is_user_joined(user_id):
+            if can_send_force_join_reminder(user_id):
+                send_force_join_ui(user_id)
+            return True
+
+    # 🚧 Maintenance Mode Check
+    if is_maintenance_mode() and not is_admin(user_id):
+        bot.send_message(user_id, get_maintenance_message(), parse_mode="Markdown")
+        return True
+
+    # 🚫 Manual Ban
+    if state == "BANNED":
+        bot.send_message(user_id, "🚫 You are banned.")
+        return True
+
+    # 🚫 Word Filter (text only)
+    if message.content_type == "text":
+        if contains_banned_word(message.text):
+            warnings = add_warning(user_id, "Banned word detected")
+            action = warning_action_for_count(warnings)
+            if action == "ban" and not is_whitelisted(user_id):
+                ban_user(user_id)
+                bot.send_message(
+                    user_id,
+                    f"🚫 You are banned. Warning limit reached ({warnings}/{MAX_WARNINGS})."
+                )
+            elif action == "restrict":
+                bot.send_message(
+                    user_id,
+                    f"⏳ Temporary restriction warning ({warnings}/{MAX_WARNINGS}). One more violation may ban you."
+                )
+            else:
+                bot.send_message(
+                    user_id,
+                    f"⚠️ Warning {warnings}/{MAX_WARNINGS} - banned word detected."
+                )
+            return True
+
+    # ❌ No Username Yet
+    if state == "NO_USERNAME":
+        bot.send_message(
+            user_id,
+            "⚠️ Please set username first using /start."
+        )
+        return True
+
+    # =========================
+    # 🟡 JOINING STATE
+    # =========================
+    if state == "JOINING":
+
+        if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+
+            with activation_lock:
+                activation_buffer[user_id] += 1
+
+                if user_id in activation_timer:
+                    return False  # allow relay but don't respond yet
+
+                activation_timer[user_id] = True
+
+            def finalize_activation():
+                time.sleep(1.0)
+
+                with activation_lock:
+                    amount = activation_buffer.pop(user_id, 0)
+                    activation_timer.pop(user_id, None)
+
+                if amount > 0:
+                    increment_media(user_id, amount)
+
+                    activated = check_activation(user_id)
+
+                    if activated:
+                        bot.send_message(
+                            user_id,
+                            f"🎉 You are now active for {get_inactivity_limit() // 3600} hours!"
+                        )
+                    else:
+                        remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
+                        bot.send_message(
+                            user_id,
+                            f"📸 {remaining} media left to join."
+                        )
+
+            threading.Thread(target=finalize_activation).start()
+
+            return False  # allow media relay
+
+        bot.send_message(
+            user_id,
+            f"🔒 Send {REQUIRED_MEDIA} media to join."
+        )
+        return True
+
+
+    # =========================
+    # 🔴 INACTIVE STATE
+    # =========================
+    if state == "INACTIVE":
+
+        if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+
+            with activation_lock:
+                activation_buffer[user_id] += 1
+
+                if user_id in activation_timer:
+                    return False
+
+                activation_timer[user_id] = True
+
+            def finalize_reactivation():
+                time.sleep(1.0)
+
+                with activation_lock:
+                    amount = activation_buffer.pop(user_id, 0)
+                    activation_timer.pop(user_id, None)
+
+                if amount > 0:
+                    increment_media(user_id, amount)
+
+                    activated = check_activation(user_id)
+
+                    if activated:
+                        bot.send_message(
+                            user_id,
+                            f"🎉 You are reactivated for {get_inactivity_limit() // 3600} hours!"
+                        )
+                    else:
+                        remaining = REQUIRED_MEDIA - get_activation_data(user_id)[0]
+                        bot.send_message(
+                            user_id,
+                            f"📸 {remaining} media left to reactivate."
+                        )
+
+            threading.Thread(target=finalize_reactivation).start()
+
+            return False
+
+        bot.send_message(
+            user_id,
+            f"⏳ You are inactive.\nSend {REQUIRED_MEDIA} media to reactivate."
+        )
+        return True
+
+
+    # =========================
+    # 🟢 ACTIVE STATE
+    # =========================
+    if state == "ACTIVE":
+
+        if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+
+            increment_media(user_id)
+            renewed = check_activation(user_id)
+
+        return False
+# =========================
+# 📥 GET ACTIVE RECEIVERS
+# =========================
+
+def get_active_receivers():
+
+    active_cutoff = int(time.time()) - get_inactivity_limit()
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT u.user_id
+                FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned = FALSE
+                  AND u.username IS NOT NULL
+                  AND (
+                        a.user_id IS NOT NULL
+                        OR u.whitelisted = TRUE
+                        OR (
+                            u.last_activation_time IS NOT NULL
+                            AND u.last_activation_time >= %s
+                        )
+                      )
+            """, (active_cutoff,))
+            return [row[0] for row in c.fetchall()]
+
+
+def get_receivers_cached(force=False):
+    global receiver_cache, receiver_cache_at
+    now = time.time()
+    with receiver_cache_lock:
+        if force or (now - receiver_cache_at) >= RECEIVER_CACHE_TTL:
+            receiver_cache = get_active_receivers()
+            receiver_cache_at = now
+        return list(receiver_cache)
+
+# =========================
+# 📝 SAVE MESSAGE MAP
+# =========================
+
+def save_mapping(bot_msg_id, original_user_id, original_message_id, receiver_id):
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                INSERT INTO message_map
+                (bot_message_id, original_user_id, original_message_id, receiver_id, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                bot_msg_id,
+                original_user_id,
+                original_message_id,
+                receiver_id,
+                int(time.time())
+            ))
+
+
+def save_mappings(rows):
+    if not rows:
+        return
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            execute_values(
+                c,
+                """
+                INSERT INTO message_map
+                (bot_message_id, original_user_id, original_message_id, receiver_id, created_at)
+                VALUES %s
+                """,
+                rows,
+                page_size=max(1, MAP_INSERT_BATCH_SIZE),
+            )
+
+
+def _retry_after_seconds(error):
+    retry_after = getattr(error, "retry_after", None)
+    if retry_after is not None:
+        try:
+            return float(retry_after)
+        except Exception:
+            return None
+    result_json = getattr(error, "result_json", None)
+    if isinstance(result_json, dict):
+        params = result_json.get("parameters", {})
+        retry_after = params.get("retry_after")
+        if retry_after is not None:
+            try:
+                return float(retry_after)
+            except Exception:
+                return None
+    return None
+
+
+def _copy_message_with_retry(user_id, sender_id, message_id, reply_to_message_id=None, **kwargs):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=sender_id,
+                message_id=message_id,
+                reply_to_message_id=reply_to_message_id,
+                **kwargs
+            )
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def _forward_message_with_retry(user_id, sender_id, message_id, **kwargs):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.forward_message(
+                chat_id=user_id,
+                from_chat_id=sender_id,
+                message_id=message_id,
+                **kwargs
+            )
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def _forward_messages_manual(chat_id, from_chat_id, message_ids):
+    """
+    Manual call to forwardMessages API to preserve album grouping.
+    Required because local telebot version < 4.14 doesn't support it.
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/forwardMessages"
+    payload = {
+        "chat_id": chat_id,
+        "from_chat_id": from_chat_id,
+        "message_ids": message_ids
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=15)
+        res = resp.json()
+        if res.get("ok"):
+            return res.get("result")
+        else:
+            print(f"Manual forwardMessages failed: {res.get('description')}")
+    except Exception as e:
+        print(f"Manual forwardMessages error: {e}")
+    return None
+
+
+def _send_text_with_retry(user_id, text, reply_to_message_id=None):
+    attempts = max(0, SEND_RETRIES) + 1
+    for i in range(attempts):
+        try:
+            sent = bot.send_message(user_id, text, reply_to_message_id=reply_to_message_id)
+            if FORWARD_DELAY > 0:
+                time.sleep(FORWARD_DELAY)
+            return sent
+        except Exception as e:
+            wait = _retry_after_seconds(e)
+            if i < attempts - 1:
+                if wait is not None:
+                    time.sleep(max(0.05, wait))
+                else:
+                    time.sleep(0.15 * (i + 1))
+                continue
+            return None
+    return None
+
+
+def broadcast_warning_notice(sender_id, target_id, warnings, reason):
+    username = get_username(target_id) or "Unknown"
+    text = (
+        "⚠️ USER WARNING\n\n"
+        f"👤 {username}\n"
+        f"🆔 {target_id}\n"
+        f"📊 {warnings}/{MAX_WARNINGS}\n"
+        f"📝 Reason: {reason}"
+    )
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    if not targets:
+        return 0
+
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    sent_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(_send_text_with_retry, uid, text): uid
+            for uid in targets
+        }
+        for future in as_completed(future_to_uid):
+            try:
+                if future.result():
+                    sent_count += 1
+            except Exception:
+                pass
+    return sent_count
+
+
+def admin_broadcast_text(sender_id, text):
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    if is_force_join_enabled():
+        receivers = [
+            uid for uid in receivers
+            if is_admin(uid) or is_vip(uid) or is_user_joined(uid)
+        ]
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    if not targets:
+        return 0
+
+    payload = f"📢 {text}"
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    sent_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(_send_text_with_retry, uid, payload): uid
+            for uid in targets
+        }
+        for future in as_completed(future_to_uid):
+            try:
+                if future.result():
+                    sent_count += 1
+            except Exception:
+                pass
+    return sent_count
+# =========================
+# 🚀 BROADCAST WORKER
+# =========================
+
+def broadcast_worker():
+
+    while True:
+        job = broadcast_queue.get()
+
+        try:
+            if job["type"] == "single":
+                _process_single(job["message"])
+
+            elif job["type"] == "album":
+                _process_album(job["messages"])
+                # external_forward.forward_single(bot, message)
+
+
+        except Exception as e:
+            print("Broadcast error:", e)
+
+        broadcast_queue.task_done()
+# =========================
+# 📤 PROCESS SINGLE MESSAGE
+# =========================
+
+def _process_single(message):
+
+    sender_id = message.chat.id
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    
+    if is_force_join_enabled():
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT user_id, currently_joined FROM firewall_tracking WHERE user_id = ANY(%s)", (receivers,))
+                tracking_data = dict(c.fetchall())
+        
+        # Use cached sets for extremely fast filtering
+        with cache_lock:
+            receivers = [
+                uid for uid in receivers
+                if uid in cached_admins or uid in cached_vips or uid in cached_whitelisted or tracking_data.get(uid, False)
+            ]
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    store_mapping = should_store_mapping(sender_id, targets)
+    mappings = []
+    now = int(time.time())
+    if not targets:
+        return
+    reply_map = {}
+    if getattr(message, "reply_to_message", None):
+        bot_msg_id_sender = message.reply_to_message.message_id
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    "SELECT original_user_id, original_message_id FROM message_map WHERE bot_message_id=%s AND receiver_id=%s LIMIT 1",
+                    (bot_msg_id_sender, sender_id)
+                )
+                row = c.fetchone()
+                if row and row[0]:
+                    orig_uid, orig_msg_id = row[0], row[1]
+                    reply_map[orig_uid] = orig_msg_id
+                    
+                    c.execute(
+                        "SELECT receiver_id, bot_message_id FROM message_map WHERE original_user_id=%s AND original_message_id=%s",
+                        (orig_uid, orig_msg_id)
+                    )
+                    for r_id, b_id in c.fetchall():
+                        reply_map[r_id] = b_id
+
+    if message.content_type == "text":
+        prefix = build_prefix(sender_id)
+        text_to_send = prefix + (message.text or "")
+        send_fn = lambda uid: _send_text_with_retry(
+            uid, text_to_send, reply_to_message_id=reply_map.get(uid)
+        )
+
+    else:
+        media_caption = get_media_caption()
+        username = get_username(sender_id) or ''
+        original_caption = message.caption or ""
+
+        if is_admin(sender_id):
+            if media_caption:
+                new_caption = media_caption.replace("{username}", username).replace("{caption}", original_caption).strip()
+            else:
+                new_caption = original_caption
+        else:
+            if media_caption:
+                new_caption = media_caption.replace("{username}", username).replace("{caption}", "").strip()
+            else:
+                new_caption = ""
+
+        send_fn = lambda uid: _copy_message_with_retry(
+            uid, sender_id, message.message_id,
+            reply_to_message_id=reply_map.get(uid),
+            caption=new_caption
+        )
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    
+    def dispatch_send(uid):
+        if uid in extra_targets:
+            # Only forward media to forward targets, skip text messages
+            if message.content_type != "text":
+                return _forward_message_with_retry(uid, sender_id, message.message_id)
+            return None
+        return send_fn(uid)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_uid = {
+            executor.submit(dispatch_send, user_id): user_id
+            for user_id in targets
+        }
+        for future in as_completed(future_to_uid):
+            user_id = future_to_uid[future]
+            try:
+                sent = future.result()
+                if sent and store_mapping:
+                    mappings.append((sent.message_id, sender_id, message.message_id, user_id, now))
+                    if len(mappings) >= MAP_INSERT_BATCH_SIZE:
+                        save_mappings(mappings)
+                        mappings.clear()
+            except Exception as e:
+                print("Single send error:", e)
+    if store_mapping:
+        save_mappings(mappings)
+
+   
+# =========================
+# 📸 PROCESS ALBUM MESSAGE
+# =========================
+
+def _process_album(messages):
+
+    sender_id = messages[0].chat.id
+    receivers = [uid for uid in get_receivers_cached() if uid != sender_id]
+    
+    if is_force_join_enabled():
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT user_id, currently_joined FROM firewall_tracking WHERE user_id = ANY(%s)", (receivers,))
+                tracking_data = dict(c.fetchall())
+        
+        # Use cached sets for extremely fast filtering
+        with cache_lock:
+            receivers = [
+                uid for uid in receivers
+                if uid in cached_admins or uid in cached_vips or uid in cached_whitelisted or tracking_data.get(uid, False)
+            ]
+    extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
+    targets = list(dict.fromkeys(receivers + extra_targets))
+    store_mapping = should_store_mapping(sender_id, targets)
+    mappings = []
+    now = int(time.time())
+    if not targets:
+        return
+    media_caption = get_media_caption()
+    username = get_username(sender_id) or 'Unknown'
+    media_items = []
+    
+    for index, msg in enumerate(messages):
+        new_caption = None
+        new_ents = None
+        
+        if index == 0:
+            original_caption = msg.caption or ""
+            username = get_username(sender_id) or ''
+            
+            if is_admin(sender_id):
+                if media_caption:
+                    new_caption = media_caption.replace("{username}", username).replace("{caption}", original_caption).strip()
+                else:
+                    new_caption = original_caption
+            else:
+                if media_caption:
+                    new_caption = media_caption.replace("{username}", username).replace("{caption}", "").strip()
+                else:
+                    new_caption = None  # 🚀 REMOVE FOR USERS
+                    
+        if msg.content_type == "photo":
+            media_items.append((
+                InputMediaPhoto(
+                    media=msg.photo[-1].file_id,
+                    caption=new_caption,
+                    caption_entities=new_ents
+                ),
+                msg.message_id,
+            ))
+        elif msg.content_type == "video":
+            media_items.append((
+                InputMediaVideo(
+                    media=msg.video.file_id,
+                    caption=new_caption,
+                    caption_entities=new_ents
+                ),
+                msg.message_id,
+            ))
+        elif msg.content_type == "document":
+            media_items.append((
+                InputMediaDocument(
+                    media=msg.document.file_id,
+                    caption=new_caption,
+                    caption_entities=new_ents
+                ),
+                msg.message_id,
+            ))
+        elif msg.content_type == "audio":
+            media_items.append((
+                InputMediaAudio(
+                    media=msg.audio.file_id,
+                    caption=new_caption,
+                    caption_entities=new_ents
+                ),
+                msg.message_id,
+            ))
+        elif msg.content_type == "animation":
+            media_items.append((
+                InputMediaAnimation(
+                    media=msg.animation.file_id,
+                    caption=new_caption,
+                    caption_entities=new_ents
+                ),
+                msg.message_id,
+            ))
+
+    chunks = [media_items[i:i+10] for i in range(0, len(media_items), 10)]
+
+    def send_album_to_user(user_id):
+        rows = []
+        
+        if user_id in extra_targets:
+            # Use forwardMessages API to preserve album grouping and forward tags
+            message_ids = [msg.message_id for msg in messages]
+            sent_msgs = _forward_messages_manual(user_id, sender_id, message_ids)
+            if store_mapping and sent_msgs:
+                for sent, original_msg in zip(sent_msgs, messages):
+                    rows.append((sent['message_id'], sender_id, original_msg.message_id, user_id, now))
+            return rows
+
+        # For normal users, send as anonymous relay (copy)
+        attempts = max(0, SEND_RETRIES) + 1
+        for chunk in chunks:
+            chunk_media = [item[0] for item in chunk]
+            for i in range(attempts):
+                try:
+                    sent_msgs = bot.send_media_group(user_id, chunk_media)
+                    if store_mapping and sent_msgs:
+                        for sent, original_message_id in zip(sent_msgs, [item[1] for item in chunk]):
+                            rows.append((sent.message_id, sender_id, original_message_id, user_id, now))
+                    break
+                except Exception as e:
+                    wait = _retry_after_seconds(e)
+                    if wait is not None:
+                        print(f"Album 429 rate-limit: waiting {wait}s before retry")
+                        time.sleep(max(1.0, wait))
+                    elif i < attempts - 1:
+                        time.sleep(0.3 * (i + 1))
+                    else:
+                        print("Album send_media_group error:", e)
+                    continue
+        return rows
+
+    workers = max(1, min(SEND_MAX_WORKERS, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(send_album_to_user, user_id) for user_id in targets]
+        for future in as_completed(futures):
+            try:
+                mappings.extend(future.result())
+                if len(mappings) >= MAP_INSERT_BATCH_SIZE:
+                    save_mappings(mappings)
+                    mappings.clear()
+            except Exception as e:
+                print("Album send error:", e)
+    if store_mapping:
+        save_mappings(mappings)
+    # external_forward.forward_album(bot, messages)
+
+
+@bot.message_handler(commands=['search'])
+def search_command(message):
+    if not is_admin(message.chat.id):
+        return
+        
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        pending_admin_search_user.add(message.from_user.id)
+        bot.send_message(message.chat.id, "🔍 *User Search*\n\nSend me any of the following to search:\n• User ID (e.g. `1234567`)\n• Telegram Username (@username)\n• Real Name (First or Last)\n• Bot Name (Custom name)\n\nType /cancel to abort.", parse_mode="Markdown")
+        return
+        
+    query = parts[1].strip()
+    perform_admin_search(message, query)
+
+
+@bot.message_handler(func=lambda m: m.from_user.id in pending_admin_search_user)
+def handle_admin_search_user(message):
+    if not is_admin(message.chat.id):
+        pending_admin_search_user.discard(message.from_user.id)
+        return
+        
+    query = message.text.strip()
+    if query.lower() == "/cancel":
+        pending_admin_search_user.discard(message.from_user.id)
+        bot.send_message(message.chat.id, "❌ Search cancelled.")
+        return
+        
+    pending_admin_search_user.discard(message.from_user.id)
+    perform_admin_search(message, query)
+
+
+def perform_admin_search(message, query):
+    bot.send_message(message.chat.id, f"🔎 Searching for `{query}`...", parse_mode="Markdown")
+    
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            clean_query = query.replace('@', '').lower()
+            
+            # Flexible search across all name/id fields
+            sql = """
+                SELECT u.user_id, u.username, u.tg_username, u.first_name, u.last_name, 
+                       u.total_media_sent, COUNT(r.user_id), u.last_activation_time
+                FROM users u
+                LEFT JOIN users r ON r.referred_by = u.user_id
+                WHERE u.user_id::text = %s
+                   OR LOWER(u.username) LIKE %s
+                   OR LOWER(u.tg_username) LIKE %s
+                   OR LOWER(u.first_name) LIKE %s
+                   OR LOWER(u.last_name) LIKE %s
+                GROUP BY u.user_id
+                LIMIT 15
+            """
+            pattern = f"%{clean_query}%"
+            c.execute(sql, (clean_query, pattern, pattern, pattern, pattern))
+            rows = c.fetchall()
+            
+    if not rows:
+        bot.send_message(message.chat.id, f"❌ No users found matching `{query}`.", parse_mode="Markdown")
+        return
+        
+    import time
+    now = int(time.time())
+    markup = InlineKeyboardMarkup(row_width=1)
+    
+    for row in rows:
+        uid, bot_name, tg_user, f_name, l_name, media, refs, last_active = row
+        
+        # Determine status icon
+        if last_active:
+            time_passed = now - last_active
+            time_left = max(0, get_inactivity_limit() - time_passed)
+            status = "🟢" if time_left > 0 else "⏳"
+        else:
+            status = "🔴"
+            
+        # Build display name for the button
+        name_parts = []
+        if f_name: name_parts.append(f_name)
+        if tg_user: name_parts.append(f"(@{tg_user})")
+        if bot_name: name_parts.append(f"[{bot_name}]")
+        
+        display_name = " ".join(name_parts) or f"User {uid}"
+        btn_text = f"{status} {display_name[:30]} | 📸 {media}"
+        
+        markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user_info:{uid}:0:all"))
+        
+    markup.add(InlineKeyboardButton("🔙 Back to Panel", callback_data="panel_users"))
+    bot.send_message(message.chat.id, f"✅ Found {len(rows)} results for `{query}`:", parse_mode="Markdown", reply_markup=markup)
+
+
+@bot.message_handler(
+    func=lambda m: (
+        m.chat.id in pending_fw_add or 
+        m.chat.id in pending_fw_remove or 
+        m.chat.id in pending_vip_add or 
+        m.chat.id in pending_vip_remove or 
+        m.chat.id in pending_fw_msg or 
+        m.chat.id in pending_admin_broadcast or 
+        m.chat.id in pending_admin_setcaption or 
+        m.chat.id in pending_admin_setwelcome or 
+        m.chat.id in pending_admin_setinactive or 
+        m.chat.id in pending_admin_setcontact or 
+        m.chat.id in pending_admin_addforward or 
+        m.chat.id in pending_recovery_import or 
+        m.chat.id in pending_admin_msg_target or 
+        m.chat.id in pending_admin_set_note
+    ),
+    content_types=['text', 'photo', 'video', 'document', 'audio', 'voice']
+)
+def handle_admin_pending_inputs(message):
+    if not is_admin(message.chat.id):
+        pending_fw_add.discard(message.chat.id)
+        pending_fw_remove.discard(message.chat.id)
+        pending_vip_add.discard(message.chat.id)
+        pending_vip_remove.discard(message.chat.id)
+        pending_fw_msg.discard(message.chat.id)
+        pending_admin_broadcast.discard(message.chat.id)
+        pending_admin_setcaption.discard(message.chat.id)
+        pending_admin_setwelcome.discard(message.chat.id)
+        pending_admin_setinactive.discard(message.chat.id)
+        pending_admin_setcontact.discard(message.chat.id)
+        pending_admin_addforward.discard(message.chat.id)
+        pending_recovery_import.discard(message.chat.id)
+        pending_admin_msg_target.discard(message.chat.id)
+        pending_admin_set_note.discard(message.chat.id)
+        return
+
+    # Handle Cancel
+    if message.content_type == 'text' and message.text == '/cancel':
+        pending_fw_add.discard(message.chat.id)
+        pending_fw_remove.discard(message.chat.id)
+        pending_vip_add.discard(message.chat.id)
+        pending_vip_remove.discard(message.chat.id)
+        pending_fw_msg.discard(message.chat.id)
+        pending_admin_broadcast.discard(message.chat.id)
+        pending_admin_setcaption.discard(message.chat.id)
+        pending_admin_setwelcome.discard(message.chat.id)
+        pending_admin_setinactive.discard(message.chat.id)
+        pending_admin_setcontact.discard(message.chat.id)
+        pending_admin_addforward.discard(message.chat.id)
+        pending_recovery_import.discard(message.chat.id)
+        pending_admin_msg_target.discard(message.chat.id)
+        pending_admin_set_note.discard(message.chat.id)
+        bot.send_message(message.chat.id, "❌ Action cancelled.")
+        return
+
+    # Special handling for Recovery Document
+    if message.chat.id in pending_recovery_import or message.from_user.id in pending_recovery_import:
+        if message.content_type != 'document':
+            bot.send_message(message.chat.id, "⚠️ Please send the JSON file as a document, or type /cancel.")
+            return
+        
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            raw = bot.download_file(file_info.file_path)
+            import json
+            payload = json.loads(raw.decode('utf-8'))
+            imported_users, imported_words = import_recovery_payload(payload)
+            pending_recovery_import.discard(message.chat.id)
+            bot.send_message(
+                message.chat.id,
+                f"✅ Recovery import complete.\n\n👤 Users: `{imported_users}`\n🚫 Banned Words: `{imported_words}`",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Import failed: {e}")
+        return
+
+    # For everything else, we require text
+    if message.content_type != 'text':
+        bot.send_message(message.chat.id, "⚠️ Please send text only for this input, or type /cancel to abort.")
+        return
+
+    text = (message.text or "").strip()
+
+    if message.chat.id in pending_fw_add:
+        name, chat_id, invite_link = parse_force_channel_input(text)
+        if chat_id and add_force_channel(chat_id, name, invite_link):
+            bot.send_message(message.chat.id, "✅ Channel added.")
+        else:
+            bot.send_message(message.chat.id, "Invalid format. Use: Name - CHAT_ID - InviteLink")
+        pending_fw_add.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_fw_remove:
+        target = text.split(" - ", 1)[1].strip() if " - " in text else text
+        remove_force_channel(target)
+        bot.send_message(message.chat.id, "❌ Channel removed.")
+        pending_fw_remove.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_vip_add:
+        try:
+            uid = int(text)
+            add_vip(uid)
+            bot.send_message(message.chat.id, "💎 VIP added.")
+        except Exception:
+            bot.send_message(message.chat.id, "Invalid ID.")
+        pending_vip_add.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_vip_remove:
+        try:
+            uid = int(text)
+            remove_vip(uid)
+            bot.send_message(message.chat.id, "❌ VIP removed.")
+        except Exception:
+            bot.send_message(message.chat.id, "Invalid ID.")
+        pending_vip_remove.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_fw_msg:
+        new_msg = text
+        if not new_msg:
+            bot.send_message(message.chat.id, "Message cannot be empty.")
+        else:
+            set_force_join_message(new_msg)
+            bot.send_message(message.chat.id, "✅ Firewall message updated.")
+        pending_fw_msg.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_broadcast:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "❌ Broadcast cancelled.")
+            pending_admin_broadcast.discard(message.chat.id)
+            pending_admin_broadcast_target.pop(message.chat.id, None)
+            return
+        
+        target = pending_admin_broadcast_target.pop(message.chat.id, "all")
+        pending_admin_broadcast.discard(message.chat.id)
+        
+        bot.send_message(message.chat.id, f"🚀 Starting targeted broadcast to: *{target.upper()}*...", parse_mode="Markdown")
+        
+        active_cutoff = int(time.time()) - get_inactivity_limit()
+        
+        # Determine targets based on selection
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                if target == "active":
+                    sql = """
+                        SELECT u.user_id FROM users u
+                        LEFT JOIN admins a ON u.user_id = a.user_id
+                        WHERE u.banned=FALSE AND u.username IS NOT NULL
+                        AND (a.user_id IS NOT NULL OR u.whitelisted=TRUE OR (u.last_activation_time IS NOT NULL AND u.last_activation_time >= %s))
+                    """
+                    c.execute(sql, (active_cutoff,))
+                elif target == "inactive":
+                    sql = """
+                        SELECT u.user_id FROM users u
+                        LEFT JOIN admins a ON u.user_id = a.user_id
+                        WHERE u.banned=FALSE AND u.username IS NOT NULL
+                        AND a.user_id IS NULL AND u.whitelisted=FALSE
+                        AND u.last_activation_time IS NOT NULL AND u.last_activation_time < %s
+                    """
+                    c.execute(sql, (active_cutoff,))
+                elif target == "pending":
+                    c.execute("SELECT user_id FROM users WHERE username IS NULL AND banned=FALSE")
+                elif target == "activation":
+                    c.execute("SELECT user_id FROM users WHERE username IS NOT NULL AND last_activation_time IS NULL AND banned=FALSE")
+                else: # all
+                    c.execute("SELECT user_id FROM users WHERE banned=FALSE")
+                
+                uids = [row[0] for row in c.fetchall()]
+        
+        if not uids:
+            bot.send_message(message.chat.id, "❌ No users found in this category.")
+            return
+
+        payload = f"📢 {text}"
+        sent_count = 0
+        workers = max(1, min(SEND_MAX_WORKERS, len(uids)))
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_uid = {executor.submit(_send_text_with_retry, uid, payload): uid for uid in uids}
+            for future in as_completed(future_to_uid):
+                if future.result(): sent_count += 1
+                
+        bot.send_message(message.chat.id, f"✅ Broadcast complete. Sent to {sent_count}/{len(uids)} users.")
+        return
+
+    if message.chat.id in pending_admin_setcaption:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Caption update cancelled.")
+            pending_admin_setcaption.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Caption cannot be empty. Type /cancel to abort or 'none' to clear.")
+            return
+        val = text if text.lower() != 'none' else ""
+        set_media_caption(val)
+        bot.send_message(message.chat.id, f"✅ Media caption updated to:\n{val}")
+        pending_admin_setcaption.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_setwelcome:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Set welcome cancelled.")
+            pending_admin_setwelcome.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Text cannot be empty.")
+            return
+        val = "" if text.lower() == 'none' else text
+        set_welcome_message(val)
+        bot.send_message(message.chat.id, "✅ Welcome message updated.")
+        pending_admin_setwelcome.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_setcontact:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Set contact message cancelled.")
+            pending_admin_setcontact.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Text cannot be empty.")
+            return
+        val = "" if text.lower() == 'none' else text
+        set_contact_message(val)
+        bot.send_message(message.chat.id, "✅ Contact info updated.")
+        pending_admin_setcontact.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_setinactive:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Set inactive message cancelled.")
+            pending_admin_setinactive.discard(message.chat.id)
+            return
+        if not text:
+            bot.send_message(message.chat.id, "Text cannot be empty.")
+            return
+        val = "" if text.lower() == 'none' else text
+        set_inactive_message(val)
+        bot.send_message(message.chat.id, "✅ Inactive message updated.")
+        pending_admin_setinactive.discard(message.chat.id)
+        return
+
+    if message.chat.id in pending_admin_msg_target:
+        uid = pending_admin_msg_target.pop(message.chat.id)
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Message cancelled.")
+            return
+        try:
+            bot.send_message(uid, f"📩 *Message from Admin:*\n\n{text}", parse_mode="Markdown")
+            bot.send_message(message.chat.id, f"✅ Message sent to `{uid}`.")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"❌ Failed to send: {e}")
+        return
+
+    if message.chat.id in pending_admin_set_note:
+        uid = pending_admin_set_note.pop(message.chat.id)
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Note update cancelled.")
+            return
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE users SET admin_notes = %s WHERE user_id = %s", (text, uid))
+        bot.send_message(message.chat.id, f"✅ Note updated for user `{uid}`.")
+        return
+
+    if message.chat.id in pending_admin_addforward:
+        if text.lower() == "/cancel":
+            bot.send_message(message.chat.id, "Add forward cancelled.")
+            pending_admin_addforward.discard(message.chat.id)
+            return
+        chat_id = None
+        target_name = None
+        try:
+            chat_id = int(text)
+        except:
+            if getattr(message, "forward_from_chat", None):
+                chat_id = message.forward_from_chat.id
+                target_name = getattr(message.forward_from_chat, "title", None)
+            else:
+                bot.send_message(message.chat.id, "Invalid CHAT_ID. Send a numeric ID or forward a text from the target channel.")
+                return
+        if chat_id:
+            add_forward_target(chat_id)
+            name_str = f" {target_name}" if target_name else ""
+            bot.send_message(message.chat.id, f"✅ Forward target added:{name_str} ({chat_id})")
+            pending_admin_addforward.discard(message.chat.id)
+        return
+
+# =========================
+# 🔁 RELAY HANDLER
+# =========================
+
+@bot.message_handler(
+    func=lambda m: not m.text or not m.text.startswith('/'),
+    content_types=['text', 'photo', 'video', 'document', 'audio', 'animation']
+)
+def relay(message):
+
+    if is_maintenance_mode() and not is_admin(message.chat.id):
+        bot.send_message(message.chat.id, "Bot is under maintenance. Try again later.")
+        return
+
+    if is_force_join_enabled() and not is_admin(message.chat.id) and not is_vip(message.chat.id):
+        is_joined, missing = is_user_joined_detailed(message.chat.id)
+        if not is_joined:
+            # Only send reminder if cooldown allows, to prevent spam
+            if can_send_force_join_reminder(message.chat.id):
+                send_force_join_ui(message.chat.id)
+            
+            try:
+                bot.delete_message(message.chat.id, message.message_id)
+            except Exception:
+                pass
+            return
+        clear_force_join_ui(message.chat.id)
+
+    # =========================
+    # ♻ DUPLICATE FILTER (EARLY)
+    # =========================
+    if message.content_type in ['photo', 'video'] and is_duplicate_filter_enabled():
+        # Bypass for Admins, VIPs, and Whitelisted users
+        if not is_admin(message.chat.id) and not is_vip(message.chat.id) and not is_whitelisted(message.chat.id):
+            file_id = (
+                message.photo[-1].file_id
+                if message.content_type == 'photo'
+                else message.video.file_id
+            )
+
+            is_dup = check_and_register_duplicate(file_id, message.chat.id)
+
+            if is_dup:
+                return  # silently ignore and DO NOT count activation
+
+    # 🆕 Ensure user exists in database even if they bypassed /start
+    if not user_exists(message.chat.id):
+        add_user(message.chat.id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
+
+    if handle_restrictions(message):
+        return
+    # =========================
+    # 1️⃣ TELEGRAM ALBUM
+    # =========================
+    if message.media_group_id:
+        group_id = message.media_group_id
+        with album_lock:
+            media_groups[group_id].append(message)
+            last_album_time[group_id] = time.time()
+            if group_id in album_timers:
+                return
+            album_timers[group_id] = True
+
+        def finalize():
+            while True:
+                time.sleep(0.5)
+                with album_lock:
+                    if time.time() - last_album_time.get(group_id, 0) >= 1.5:
+                        album = media_groups.pop(group_id, [])
+                        album_timers.pop(group_id, None)
+                        last_album_time.pop(group_id, None)
+                        break
+            if album:
+                broadcast_queue.put({
+                    "type": "album",
+                    "messages": album
+                })
+
+        threading.Thread(target=finalize, daemon=True).start()
+        return
+
+    # =========================
+    # 2️⃣ SINGLE MEDIA
+    # =========================
+    if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+        broadcast_queue.put({
+            "type": "single",
+            "message": message
+        })
+        return
+
+    # =========================
+    # 3️⃣ TEXT
+    # =========================
+    broadcast_queue.put({
+        "type": "single",
+        "message": message
+    })
+# =========================
+# ⏳ INACTIVITY SCHEDULER
+# =========================
+
+def inactivity_scheduler():
+
+    while True:
+        try:
+            auto_ban_inactive_users()
+        except Exception as e:
+            print("Inactivity scheduler error:", e)
+
+        time.sleep(60)  # check every 60 seconds
+# =========================
+# 🧹 MESSAGE MAP CLEANUP
+# =========================
+
+def message_map_cleanup_scheduler():
+
+    while True:
+        try:
+            cutoff = int(time.time()) - (MAP_RETENTION_DAYS * 86400)
+            while True:
+                with get_connection() as conn:
+                    with conn.cursor() as c:
+                        c.execute(
+                            """
+                            WITH batch AS (
+                                SELECT ctid
+                                FROM message_map
+                                WHERE created_at < %s
+                                LIMIT %s
+                            )
+                            DELETE FROM message_map
+                            USING batch
+                            WHERE message_map.ctid = batch.ctid
+                            RETURNING 1
+                            """,
+                            (cutoff, MAP_DELETE_BATCH_SIZE),
+                        )
+                        removed = len(c.fetchall())
+                if removed < MAP_DELETE_BATCH_SIZE:
+                    break
+        except Exception as e:
+            print("Cleanup error:", e)
+
+        time.sleep(MAP_CLEANUP_INTERVAL_SECONDS)
+
+
+def message_map_overflow_guard():
+    """Auto-delete oldest message_map rows when total count exceeds MAP_MAX_SIZE."""
+    while True:
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT COUNT(*) FROM message_map")
+                    total = c.fetchone()[0]
+
+            if total > MAP_MAX_SIZE:
+                to_delete = total - MAP_MAX_SIZE
+                print(f"[MapGuard] message_map has {total} rows, pruning {to_delete} oldest rows...")
+                deleted = 0
+                while deleted < to_delete:
+                    batch = min(MAP_DELETE_BATCH_SIZE, to_delete - deleted)
+                    with get_connection() as conn:
+                        with conn.cursor() as c:
+                            c.execute(
+                                """
+                                WITH batch AS (
+                                    SELECT ctid FROM message_map
+                                    ORDER BY created_at ASC
+                                    LIMIT %s
+                                )
+                                DELETE FROM message_map
+                                USING batch
+                                WHERE message_map.ctid = batch.ctid
+                                RETURNING 1
+                                """,
+                                (batch,)
+                            )
+                            removed = len(c.fetchall())
+                    deleted += removed
+                    if removed < batch:
+                        break
+                print(f"[MapGuard] Pruned {deleted} rows. New count: {total - deleted}")
+        except Exception as e:
+            print(f"[MapGuard] Error: {e}")
+        time.sleep(3600)  # check once per hour
+
+
+def auto_db_backup_scheduler():
+    """Send a DB export JSON to all admins every DB_BACKUP_INTERVAL_HOURS hours."""
+    # Wait 5 minutes after startup before the first backup
+    time.sleep(300)
+    while True:
+        try:
+            payload = export_recovery_payload()
+            temp_path = None
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT user_id FROM admins")
+                    admin_ids = [row[0] for row in c.fetchall()]
+
+            import datetime
+            ts = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8",
+                                            prefix=f"db_backup_{ts}_") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                temp_path = f.name
+
+            for admin_id in admin_ids:
+                try:
+                    with open(temp_path, "rb") as doc:
+                        bot.send_document(
+                            admin_id,
+                            doc,
+                            caption=(
+                                f"🗄 *Auto DB Backup*\n"
+                                f"🕐 `{ts} UTC`\n"
+                                f"📦 Contains: users, banned list, admin notes, settings"
+                            ),
+                            parse_mode="Markdown"
+                        )
+                except Exception as e:
+                    print(f"[Backup] Failed to send to admin {admin_id}: {e}")
+        except Exception as e:
+            print(f"[Backup] Export error: {e}")
+        finally:
+            try:
+                if temp_path and os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+
+        time.sleep(DB_BACKUP_INTERVAL_HOURS * 3600)
+
+
+def force_join_enforcement_scheduler():
+    while True:
+        try:
+            if is_force_join_enabled():
+                users = get_active_receivers()
+                users = random.sample(users, min(len(users), 300))
+                for user_id in users:
+                    if is_admin(user_id) or is_vip(user_id):
+                        continue
+                    if not is_user_joined(user_id):
+                        if can_send_force_join_reminder(user_id):
+                            try:
+                                bot.send_message(
+                                    user_id,
+                                    "🚫 Please rejoin required channels to continue using the bot."
+                                )
+                            except Exception:
+                                pass
+        except Exception as e:
+            print("Force join check error:", e)
+
+        time.sleep(300)
+
+
+def firewall_hourly_cleanup_scheduler():
+    """Truncates firewall_tracking every hour to save space and force re-verification."""
+    while True:
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("TRUNCATE firewall_tracking")
+            
+            # Clear memory cache so the bot performs fresh checks
+            with force_join_cache_lock:
+                force_join_cache.clear()
+                
+            print("🕒 Firewall tracking table truncated and cache cleared (Hourly Cleanup).")
+        except Exception as e:
+            print(f"Firewall cleanup error: {e}")
+        
+        time.sleep(3600)
+
+
+def keep_alive_scheduler():
+    """Self-ping to keep Render Web Service awake and check DB health."""
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
+    
+    print(f"📡 Keep-alive thread started. Monitoring URL: {url or 'NONE'}")
+    
+    while True:
+        # 1. URL Heartbeat
+        if url:
+            try:
+                # Wait 30s before first ping to allow server boot
+                time.sleep(30)
+                response = requests.get(url, timeout=15)
+                print(f"📡 Web Heartbeat: OK ({response.status_code})")
+            except Exception as e:
+                print(f"📡 Web Heartbeat: FAILED: {e}")
+        
+        # 2. Database Heartbeat
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("SELECT 1")
+            print("📡 Database Heartbeat: OK")
+        except Exception as e:
+            print(f"📡 Database Heartbeat: FAILED: {e}. Pool will re-init on next request.")
+
+        # Ping every 10 minutes (be slightly faster than Render's 15m timeout)
+        time.sleep(10 * 60)
+# =========================
+# 🚀 START BACKGROUND WORKERS
+# =========================
+
+def start_background_workers():
+
+    # Broadcast Workers (3 parallel workers is optimal for rate-limit balancing)
+    for _ in range(3):
+        threading.Thread(
+            target=broadcast_worker,
+            daemon=True
+        ).start()
+
+    # Inactivity Scheduler
+    threading.Thread(
+        target=inactivity_scheduler,
+        daemon=True
+    ).start()
+
+    # Cleanup Scheduler
+    threading.Thread(
+        target=message_map_cleanup_scheduler,
+        daemon=True
+    ).start()
+
+    # Force Join Enforcement Scheduler
+    # threading.Thread(
+    #     target=force_join_enforcement_scheduler,
+    #     daemon=True
+    # ).start()
+
+    # Message Map Overflow Guard (auto-purge when > MAP_MAX_SIZE rows)
+    threading.Thread(
+        target=message_map_overflow_guard,
+        daemon=True
+    ).start()
+
+    # Auto DB Backup (sends export to all admins every DB_BACKUP_INTERVAL_HOURS)
+    threading.Thread(
+        target=auto_db_backup_scheduler,
+        daemon=True
+    ).start()
+
+    # Keep Alive (for Render Free Tier)
+    threading.Thread(
+        target=keep_alive_scheduler,
+        daemon=True
+    ).start()
+
+    # Firewall Hourly Cleanup
+    threading.Thread(
+        target=firewall_hourly_cleanup_scheduler,
+        daemon=True
+    ).start()
+    
+# =========================
+# ADMIN COMMANDS
+# ========================
+@bot.message_handler(commands=['dupon'])
+def enable_duplicate_filter(message):
+    if not is_admin(message.chat.id):
+        bot.send_message(message.chat.id, "Not admin.")
+        return
+
+    set_duplicate_filter(True)
+    bot.send_message(message.chat.id, "✅ Duplicate filter ENABLED.")
+
+
+@bot.message_handler(commands=['dupoff'])
+def disable_duplicate_filter(message):
+    if not is_admin(message.chat.id):
+        bot.send_message(message.chat.id, "Not admin.")
+        return
+
+    set_duplicate_filter(False)
+    bot.send_message(message.chat.id, "❌ Duplicate filter DISABLED.")
+
+
+@bot.message_handler(commands=['dupstatus'])
+def duplicate_status(message):
+    if not is_admin(message.chat.id):
+        return
+
+    status = "ON" if is_duplicate_filter_enabled() else "OFF"
+    bot.send_message(message.chat.id, f"♻ Duplicate filter is {status}")
+    
+@bot.message_handler(commands=['del'])
+def delete_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    bot_msg_id = message.reply_to_message.message_id
+
+    deleted_count = delete_message_globally(message.chat.id, bot_msg_id)
+    if deleted_count == 0:
+        bot.send_message(
+            message.chat.id,
+            "No mapping found for this message. It may be old/cleaned or mapping mode is too strict."
+        )
+        return
+
+    bot.send_message(message.chat.id, f"🗑 Message deleted in {deleted_count} chats.")
+@bot.message_handler(commands=['addforward'])
+def add_forward_target_cmd(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    chat_id = None
+    target_name = None
+    parts = message.text.split()
+
+    if len(parts) >= 2:
+        try:
+            chat_id = int(parts[1])
+        except:
+            bot.send_message(message.chat.id, "Invalid CHAT_ID.")
+            return
+    elif message.reply_to_message:
+        source_chat = getattr(message.reply_to_message, "forward_from_chat", None)
+        if source_chat:
+            chat_id = source_chat.id
+            target_name = getattr(source_chat, "title", None)
+
+    if chat_id is None:
+        bot.send_message(
+            message.chat.id,
+            "Usage: /addforward CHAT_ID\nOr reply to a forwarded message from the target group/channel."
+        )
+        return
+
+    add_forward_target(chat_id)
+
+    if target_name:
+        bot.send_message(message.chat.id, f"Forward target added: {target_name} ({chat_id})")
+    else:
+        bot.send_message(message.chat.id, f"Forward target added: {chat_id}")
+
+@bot.message_handler(commands=['purge'])
+def purge_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    bot_msg_id = message.reply_to_message.message_id
+    user_id = get_original_sender(bot_msg_id, message.chat.id)
+
+    if not user_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    purge_user_messages(user_id)
+    bot.send_message(message.chat.id, "🔥 User messages purged.")
+@bot.message_handler(commands=['apurgeall'])
+def apurgeall_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    deleted_count = purge_all_user_messages()
+    bot.send_message(
+        message.chat.id,
+        f"Purged all mapped user messages. Deleted: {deleted_count}"
+    )
+
+def _panel_send_or_edit(chat_id, text, markup, message_id=None):
+    if message_id is not None:
+        try:
+            bot.edit_message_text(
+                text,
+                chat_id=chat_id,
+                message_id=message_id,
+                parse_mode="Markdown",
+                reply_markup=markup,
+            )
+            return
+        except Exception:
+            pass
+    bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=markup)
+
+
+def _panel_main_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("📊 Stats", callback_data="panel_stats"),
+        InlineKeyboardButton("👥 Users", callback_data="panel_users"),
+    )
+    markup.add(
+        InlineKeyboardButton("🧱 Firewall", callback_data="panel_firewall"),
+        InlineKeyboardButton("⚙ System", callback_data="panel_system"),
+    )
+    markup.add(
+        InlineKeyboardButton("🚫 Moderation", callback_data="panel_moderation"),
+        InlineKeyboardButton("💎 VIP", callback_data="panel_vip"),
+    )
+    return markup
+
+
+def _panel_firewall_markup():
+    enabled = is_force_join_enabled()
+    status = "🟢 ENABLED" if enabled else "🔴 DISABLED"
+    channels = get_force_join_channels()
+    channel_count = len(channels)
+    
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("➕ Add Channel", callback_data="fw_add"),
+        InlineKeyboardButton("➖ Remove Channel", callback_data="fw_remove"),
+    )
+    markup.add(
+        InlineKeyboardButton("✏️ Edit Message", callback_data="fw_edit_msg"),
+        InlineKeyboardButton("📊 Manage Channels", callback_data="fw_status"),
+    )
+    markup.add(
+        InlineKeyboardButton("📈 Statistics", callback_data="fw_stats")
+    )
+    markup.add(
+        InlineKeyboardButton("🟢 Enable", callback_data="fw_on"),
+        InlineKeyboardButton("🔴 Disable", callback_data="fw_off"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back to Main", callback_data="panel_back"))
+    return markup
+
+
+def _panel_system_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🚪 Open Join", callback_data="admin_open_join"),
+        InlineKeyboardButton("🔒 Close Join", callback_data="admin_close_join"),
+    )
+    markup.add(
+        InlineKeyboardButton("📤 Export", callback_data="admin_export_recovery"),
+        InlineKeyboardButton("📥 Import", callback_data="admin_import_recovery"),
+    )
+    
+    m_mode = is_maintenance_mode()
+    m_text = "🟢 Disable Maintenance" if m_mode else "🚧 Enable Maintenance"
+    markup.add(InlineKeyboardButton(m_text, callback_data="admin_toggle_maintenance"))
+
+    markup.add(
+        InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap"),
+        InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
+    )
+    markup.add(
+        InlineKeyboardButton("📣 Broadcast", callback_data="panel_broadcast"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+
+def _panel_vip_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("➕ Add VIP", callback_data="vip_add"),
+        InlineKeyboardButton("➖ Remove VIP", callback_data="vip_remove"),
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+
+def _panel_users_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("👥 All Users", callback_data="admin_userlist:0:all"),
+        InlineKeyboardButton("🟢 Active Only", callback_data="admin_userlist:0:active"),
+    )
+    markup.add(
+        InlineKeyboardButton("🎁 Refs > 0", callback_data="admin_userlist:0:refs"),
+        InlineKeyboardButton("☠️ 0 Uploads", callback_data="admin_userlist:0:dead"),
+    )
+    markup.add(
+        InlineKeyboardButton("🔍 Search User", callback_data="admin_search_user"),
+        InlineKeyboardButton("🏆 Leaderboards", callback_data="admin_leaderboards_menu")
+    )
+    markup.add(
+        InlineKeyboardButton("⏳ Set Limit", callback_data="admin_setlimit"),
+        InlineKeyboardButton("🎁 Set Grace", callback_data="admin_setgrace")
+    )
+    markup.add(
+        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+
+def _panel_moderation_markup():
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("🚫 Banned List", callback_data="admin_banned"),
+        InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap"),
+    )
+    markup.add(
+        InlineKeyboardButton("📝 Edit Caption", callback_data="admin_setcaption"),
+        InlineKeyboardButton("👋 Set Welcome", callback_data="admin_setwelcome")
+    )
+    markup.add(
+        InlineKeyboardButton("➕ Add Forward", callback_data="admin_addforward"),
+        InlineKeyboardButton("⏳ Set Inactive", callback_data="admin_setinactive")
+    )
+    markup.add(
+        InlineKeyboardButton("🎁 Global Gift Menu", callback_data="admin_global_gift_menu")
+    )
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+    return markup
+
+def _panel_global_gift_markup(admin_id):
+    data = pending_admin_global_gift_data.get(admin_id, {"target": "all", "hours": 12})
+    target = data.get("target", "all")
+    hours = data.get("hours", 12)
+    
+    markup = InlineKeyboardMarkup(row_width=3)
+    
+    # Target Selection
+    t_all = "✅ All Users" if target == "all" else "All Users"
+    t_senders = "✅ Senders" if target == "senders" else "Senders Only"
+    t_none = "✅ Newbies" if target == "non_senders" else "Non-Senders"
+    
+    markup.add(
+        InlineKeyboardButton(t_all, callback_data="gg_target:all"),
+        InlineKeyboardButton(t_senders, callback_data="gg_target:senders"),
+        InlineKeyboardButton(t_none, callback_data="gg_target:non_senders")
+    )
+    
+    # Hour Selection
+    h1 = "✅ +1h" if hours == 1 else "+1h"
+    h3 = "✅ +3h" if hours == 3 else "+3h"
+    h6 = "✅ +6h" if hours == 6 else "+6h"
+    h12 = f"✅ +{hours}h (Full)" if hours >= 12 else "+Full Cycle"
+    
+    markup.add(
+        InlineKeyboardButton(h1, callback_data="gg_hours:1"),
+        InlineKeyboardButton(h3, callback_data="gg_hours:3"),
+        InlineKeyboardButton(h6, callback_data="gg_hours:6")
+    )
+    markup.add(InlineKeyboardButton(h12, callback_data="gg_hours:12"))
+    
+    # Action Buttons
+    markup.add(InlineKeyboardButton("🚀 EXECUTE GLOBAL GIFT", callback_data="gg_execute"))
+    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_moderation"))
+    
+    return markup
+
+
+@bot.message_handler(commands=['contact', 'admininfo'])
+def contact_command(message):
+    bot.send_message(message.chat.id, get_contact_message())
+
+@bot.message_handler(commands=['setcontact'])
+def set_contact_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+    pending_admin_setcontact.add(message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        "✉️ Send the new contact/admin info message text. Type /cancel to abort.\nType 'none' to remove it."
+    )
+
+@bot.message_handler(commands=['setinactivemsg'])
+def set_inactive_message_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+        
+    parts = message.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        if message.reply_to_message and message.reply_to_message.text:
+            new_text = message.reply_to_message.text
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Usage: /setinactivemsg [Your inactive message here]\nOr reply to a text message with /setinactivemsg.\nType 'none' to remove it."
+            )
+            return
+    else:
+        new_text = parts[1].strip()
+
+    if new_text.lower() == 'none':
+        new_text = ""
+
+    set_inactive_message(new_text)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Inactive message updated."
+    )
+
+@bot.message_handler(commands=['panel'])
+def admin_panel(message):
+    if not is_admin(message.chat.id):
+        return
+    panel_text = (
+        "🛠 *ADMIN DASHBOARD*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Welcome to the central control unit. Select a module below to manage your bot."
+    )
+    _panel_send_or_edit(
+        message.chat.id,
+        panel_text,
+        _panel_main_markup(),
+    )
+@bot.message_handler(commands=['setwelcome'])
+def set_welcome_cmd(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        # Fallback to checking reply for backwards compatibility or if they prefer replies
+        if message.reply_to_message and message.reply_to_message.text:
+            new_text = message.reply_to_message.text
+        else:
+            bot.send_message(
+                message.chat.id,
+                "Usage: /setwelcome [Your welcome message here]\nOr reply to a text message with /setwelcome.\nType 'none' to remove it."
+            )
+            return
+    else:
+        new_text = parts[1].strip()
+
+    if new_text.lower() == 'none':
+        new_text = ""
+
+    set_welcome_message(new_text)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ Welcome message updated."
+    )
+
+
+@bot.message_handler(commands=['setlimit'])
+def set_limit_command(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.send_message(message.chat.id, "❌ Usage: /setlimit <hours>")
+        return
+    
+    hours = int(parts[1])
+    if hours < 1:
+        bot.send_message(message.chat.id, "❌ Limit must be at least 1 hour.")
+        return
+        
+    import time
+    now = int(time.time())
+    new_limit_seconds = hours * 3600
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('inactivity_limit_hours', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """, (str(hours),)
+            )
+            c.execute(
+                """
+                UPDATE users
+                SET auto_banned = FALSE
+                WHERE auto_banned = TRUE
+                  AND last_activation_time IS NOT NULL
+                  AND last_activation_time >= %s
+                """, (now - new_limit_seconds,)
+            )
+            unbanned_count = c.rowcount
+            
+    revived_msg = f"\n\n♻️ Automatically revived {unbanned_count} users who fell back into the new active time window!" if unbanned_count > 0 else ""
+    bot.send_message(message.chat.id, f"✅ Inactivity limit updated to {hours} hours.{revived_msg}")
+
+
+@bot.message_handler(commands=['setgrace'])
+def set_grace_command(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        bot.send_message(message.chat.id, "❌ Usage: /setgrace <hours>\n(Set to 0 to require 12 media immediately)")
+        return
+    
+    hours = int(parts[1])
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('new_user_grace_hours', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """, (str(hours),)
+            )
+            
+    bot.send_message(message.chat.id, f"✅ New user grace period updated to {hours} hours.")
+
+
+@bot.message_handler(commands=['stats'])
+def stats_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    active_cutoff = int(time.time()) - get_inactivity_limit()
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            # 1. Total
+            c.execute("SELECT COUNT(*) FROM users")
+            total = c.fetchone()[0]
+
+            # 2. Active (Verified, within window)
+            c.execute("""
+                SELECT COUNT(*) FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned=FALSE
+                  AND u.username IS NOT NULL
+                  AND (
+                        a.user_id IS NOT NULL
+                        OR u.whitelisted=TRUE
+                        OR (
+                            u.last_activation_time IS NOT NULL
+                            AND u.last_activation_time >= %s
+                        )
+                      )
+            """, (active_cutoff,))
+            active = c.fetchone()[0]
+
+            # 3. Inactive (Verified, outside window)
+            c.execute("""
+                SELECT COUNT(*) FROM users u
+                LEFT JOIN admins a ON u.user_id = a.user_id
+                WHERE u.banned=FALSE
+                  AND u.username IS NOT NULL
+                  AND a.user_id IS NULL
+                  AND u.whitelisted=FALSE
+                  AND u.last_activation_time IS NOT NULL
+                  AND u.last_activation_time < %s
+            """, (active_cutoff,))
+            inactive = c.fetchone()[0]
+
+            # 4. Pending Setup (Started bot, no name yet)
+            c.execute("SELECT COUNT(*) FROM users WHERE username IS NULL AND banned=FALSE")
+            pending_setup = c.fetchone()[0]
+
+            # 5. Pending Activation (Set name, but never sent media)
+            c.execute("SELECT COUNT(*) FROM users WHERE username IS NOT NULL AND last_activation_time IS NULL AND banned=FALSE")
+            pending_activation = c.fetchone()[0]
+
+            # 6. Banned
+            c.execute("SELECT COUNT(*) FROM users WHERE banned=TRUE")
+            banned = c.fetchone()[0]
+
+            c.execute("SELECT COUNT(*) FROM users WHERE whitelisted=TRUE")
+            whitelisted = c.fetchone()[0]
+
+            c.execute("SELECT COUNT(*) FROM message_map")
+            map_count = c.fetchone()[0]
+            c.execute("SELECT COALESCE(SUM(duplicate_count), 0) FROM media_duplicates")
+            duplicate_total = c.fetchone()[0]
+    join_status = "OPEN" if is_join_open() else "CLOSED"
+    inactivity_limit_hrs = get_inactivity_limit() // 3600
+    grace_hrs = get_new_user_grace_hours()
+
+    bot.send_message(
+        message.chat.id,
+        f"""
+📊 **SYSTEM STATUS & METRICS**
+━━━━━━━━━━━━━━━━━━━━
+
+👥 **Total Population:** `{total}`
+
+✅ **Active Members:** `{active}`
+⏳ **Inactive Members:** `{inactive}`
+🚫 **Banned Users:** `{banned}`
+🌟 **VIP Users:** `{whitelisted}`
+
+⚠️ **Pending Setup:** `{pending_setup}`
+⏳ **Pending Joining:** `{pending_activation}`
+
+📂 **Mapfile Entries:** `{map_count}`
+♻️ **Duplicates Blocked:** `{duplicate_total}`
+
+🚪 **Join Status:** `{join_status}`
+⏱ **Active Window:** `{inactivity_limit_hrs} Hours`
+🎁 **New User Grace:** `{grace_hrs} Hours`
+━━━━━━━━━━━━━━━━━━━━
+        """,
+        parse_mode="Markdown"
+    )
+
+@bot.message_handler(commands=['info'])
+def info_command(message):
+    if not is_admin(message.chat.id):
+        # Optional: bot.reply_to(message, "❌ Admin access required.")
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "❌ <b>Error:</b> Reply to a relayed message to get user info.", parse_mode="HTML")
+        return
+
+    try:
+        bot_msg_id = message.reply_to_message.message_id
+        # Try direct mapping first (for this chat)
+        user_id = get_original_sender(bot_msg_id, message.chat.id)
+        
+        # Fallback: Try global mapping (if admin is replying in a group where mapping isn't perfect)
+        if not user_id:
+            user_id = get_original_sender(bot_msg_id)
+
+        if not user_id:
+            bot.send_message(message.chat.id, "❌ <b>Error:</b> User not found in database for this message.", parse_mode="HTML")
+            return
+
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
+                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.user_id = %s
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                """, (user_id,))
+                row = c.fetchone()
+                
+        if not row:
+            bot.send_message(message.chat.id, "❌ <b>Error:</b> Profile data not found for user ID.")
+            return
+            
+        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username, is_banned_user = row
+        now = int(time.time())
+        import datetime
+        joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
+        
+        status_str = "🔴 BANNED" if is_banned_user else "🔴 Inactive"
+        if not is_banned_user and last_active:
+            time_passed = now - last_active
+            time_left = max(0, get_inactivity_limit() - time_passed)
+            if time_left > 0:
+                status_str = f"🟢 {time_left // 3600}h {(time_left % 3600) // 60}m"
+            
+        rep_emoji = {"Trusted": "👑", "Neutral": "👤", "Suspicious": "⚠️", "Scammer": "🚫"}.get(reputation, "👤")
+        full_name = f"{first_name or ''} {last_name or ''}".strip() or "Anonymous"
+        display_tg_user = f"@{tg_username}" if tg_username else "No Username"
+        
+        # Use HTML for better stability
+        from telebot.util import smart_split
+        
+        def h_esc(text):
+            if not text: return ""
+            return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+        text = (
+            f"💳 <b>USER ID CARD</b>\n"
+            f"────────────────────\n"
+            f"👤 <b>Identity:</b> <code>{h_esc(full_name)}</code>\n"
+            f"🌐 <b>Alias:</b> <code>{h_esc(display_tg_user)}</code>\n"
+            f"🤖 <b>Bot ID:</b> <code>{h_esc(bot_username or 'None')}</code>\n"
+            f"🆔 <b>Serial:</b> <code>{user_id}</code>\n"
+            f"────────────────────\n"
+            f"📊 <b>DATA LOGS</b>\n"
+            f"📸 Uploads: <code>{media}</code> | 👥 Refs: <code>{refs}</code>\n"
+            f"⏱ Window: {status_str}\n"
+            f"────────────────────\n"
+            f"🏷 <b>Rep:</b> {rep_emoji} <b>{reputation}</b>\n"
+            f"📅 <b>Born:</b> <code>{joined_str}</code>\n\n"
+            f"📝 <b>NOTES:</b>\n"
+            f"<i>{h_esc(notes or 'No data recorded.')}</i>"
+        )
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{user_id}"),
+            InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{user_id}")
+        )
+        if tg_username:
+            markup.add(
+                InlineKeyboardButton("👤 Direct DM", url=f"https://t.me/{tg_username}"),
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
+            )
+        else:
+            markup.add(
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
+            )
+        ban_btn = InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_user:{user_id}") if is_banned_user else InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}")
+        markup.add(
+            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
+            ban_btn
+        )
+        markup.add(
+            InlineKeyboardButton("🎁 Gift Cycle", callback_data=f"admin_gift_cycle:{user_id}"),
+            InlineKeyboardButton("🔙 Close", callback_data="delete_message")
+        )
+        
+        bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ <b>System Error:</b> <code>{h_esc(str(e))}</code>", parse_mode="HTML")
+
+@bot.message_handler(commands=['warn'])
+def warn_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    parts = message.text.split(maxsplit=1)
+    reason = parts[1].strip() if len(parts) > 1 and parts[1].strip() else "No reason provided"
+
+    target_id = get_original_sender(
+        message.reply_to_message.message_id,
+        message.chat.id
+    )
+
+    if not target_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    if is_admin(target_id):
+        bot.send_message(message.chat.id, "You cannot warn another admin.")
+        return
+
+    warnings = add_warning(target_id, reason)
+    action = warning_action_for_count(warnings)
+
+    try:
+        bot.send_message(
+            target_id,
+            f"⚠️ You received a warning ({warnings}/{MAX_WARNINGS}).\nReason: {reason}"
+        )
+    except Exception:
+        pass
+
+    broadcast_warning_notice(message.chat.id, target_id, warnings, reason)
+
+    if action == "ban" and not is_whitelisted(target_id):
+        ban_user(target_id)
+        bot.send_message(
+            message.chat.id,
+            f"🚫 User {target_id} banned (warnings exceeded: {warnings}/{MAX_WARNINGS})."
+        )
+    elif action == "restrict":
+        try:
+            bot.send_message(
+                target_id,
+                "⏳ You are temporarily restricted. Next violation can lead to ban."
+            )
+        except Exception:
+            pass
+        bot.send_message(
+            message.chat.id,
+            f"⏳ User {target_id} reached soft-punishment level ({warnings}/{MAX_WARNINGS}).\nReason: {reason}"
+        )
+    else:
+        bot.send_message(
+            message.chat.id,
+            f"⚠️ Warning added.\nUser now has {warnings}/{MAX_WARNINGS} warnings.\nReason: {reason}"
+        )
+
+
+@bot.message_handler(commands=['warnings'])
+def warnings_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    target_id = get_original_sender(
+        message.reply_to_message.message_id,
+        message.chat.id
+    )
+
+    if not target_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    warnings, last_reason = get_warning_details(target_id)
+    bot.send_message(
+        message.chat.id,
+        f"⚠️ User has {warnings}/{MAX_WARNINGS} warnings.\n📝 Last Reason: {last_reason}"
+    )
+
+
+@bot.message_handler(commands=['resetwarn'])
+def resetwarn_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    if not message.reply_to_message:
+        bot.send_message(message.chat.id, "Reply to a relayed message.")
+        return
+
+    target_id = get_original_sender(
+        message.reply_to_message.message_id,
+        message.chat.id
+    )
+
+    if not target_id:
+        bot.send_message(message.chat.id, "User not found.")
+        return
+
+    reset_warnings(target_id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ Warnings reset for {target_id}."
+    )
+
+@bot.message_handler(commands=['ban'])
+def ban_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    target_id = None
+
+    # 🔹 1️⃣ If used as reply
+    if message.reply_to_message:
+        bot_msg_id = message.reply_to_message.message_id
+        target_id = get_original_sender(bot_msg_id, message.chat.id)
+
+        if not target_id:
+            bot.send_message(message.chat.id, "User not found.")
+            return
+
+    # 🔹 2️⃣ If used with ID
+    else:
+        parts = message.text.split()
+
+        if len(parts) < 2:
+            bot.send_message(message.chat.id, "Usage:\n/ban USER_ID\nor reply to a relayed message.")
+            return
+
+        try:
+            target_id = int(parts[1])
+        except:
+            bot.send_message(message.chat.id, "Invalid USER_ID.")
+            return
+
+    # 🔒 Final validation
+    if not user_exists(target_id):
+        bot.send_message(message.chat.id, "User not found in database.")
+        return
+
+    if is_admin(target_id):
+        bot.send_message(message.chat.id, "You cannot ban another admin.")
+        return
+
+    ban_user(target_id)
+
+    bot.send_message(
+        message.chat.id,
+        f"🚫 User {target_id} banned."
+    )
+@bot.message_handler(commands=['unban'])
+def unban_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    target_id = None
+
+    # 🔹 1️⃣ If used as reply
+    if message.reply_to_message:
+        bot_msg_id = message.reply_to_message.message_id
+        target_id = get_original_sender(bot_msg_id, message.chat.id)
+
+        if not target_id:
+            bot.send_message(message.chat.id, "User not found.")
+            return
+
+    # 🔹 2️⃣ If used with ID
+    else:
+        parts = message.text.split()
+
+        if len(parts) < 2:
+            bot.send_message(
+                message.chat.id,
+                "Usage:\n/unban USER_ID\nor reply to a relayed message."
+            )
+            return
+
+        try:
+            target_id = int(parts[1])
+        except:
+            bot.send_message(message.chat.id, "Invalid USER_ID.")
+            return
+
+    # 🔍 Final validation
+    if not user_exists(target_id):
+        bot.send_message(message.chat.id, "User not found in database.")
+        return
+
+    unban_user(target_id)
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ User {target_id} unbanned."
+    )
+@bot.message_handler(commands=['addadmin'])
+def addadmin_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        return
+
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    add_admin(target_id)
+    bot.send_message(message.chat.id, "Admin added.")
+@bot.message_handler(commands=['removeadmin'])
+def removeadmin_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        return
+
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    remove_admin(target_id)
+    bot.send_message(message.chat.id, "Admin removed.")
+@bot.message_handler(commands=['openjoin'])
+def openjoin_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    set_join_status(True)
+    bot.send_message(message.chat.id, "Join opened.")
+@bot.message_handler(commands=['closejoin'])
+def closejoin_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    set_join_status(False)
+    bot.send_message(message.chat.id, "Join closed.")
+@bot.message_handler(commands=['clearmap'])
+def clearmap_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("DELETE FROM message_map")
+
+    bot.send_message(message.chat.id, "Message map cleared.")
+@bot.message_handler(commands=['whitelist'])
+def whitelist_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /whitelist USER_ID")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    whitelist_user(target_id)
+
+    bot.send_message(
+        message.chat.id,
+        f"⭐ User {target_id} added to whitelist."
+    )
+@bot.message_handler(commands=['unwhitelist'])
+def unwhitelist_command(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /unwhitelist USER_ID")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    remove_whitelist(target_id)
+
+    bot.send_message(
+        message.chat.id,
+        f"❌ User {target_id} removed from whitelist."
+    )
+@bot.message_handler(commands=['closebot'])
+def closebot_command(message):
+    if not is_admin(message.chat.id):
+        return
+    set_maintenance_mode(True)
+    bot.send_message(message.chat.id, "Maintenance mode enabled. Bot is closed for users.")
+
+
+@bot.message_handler(commands=['openbot'])
+def openbot_command(message):
+    if not is_admin(message.chat.id):
+        return
+    set_maintenance_mode(False)
+    bot.send_message(message.chat.id, "Maintenance mode disabled. Bot is open now.")
+
+
+@bot.message_handler(commands=['setforcejoin'])
+def set_force_join_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage:\n/setforcejoin CHAT_ID_OR_@USERNAME [message]")
+        return
+
+    chat_ref = parts[1].strip()
+    custom_message = parts[2] if len(parts) > 2 else "🚫 Please join to continue."
+    set_force_join(chat_ref, custom_message)
+    if "t.me/+" in chat_ref:
+        bot.send_message(
+            message.chat.id,
+            "✅ Force join enabled, but invite-link based channels may fail membership verification. Prefer @username or numeric chat ID."
+        )
+    else:
+        bot.send_message(message.chat.id, f"✅ Force join enabled for: {chat_ref}")
+
+
+@bot.message_handler(commands=['addfw'])
+def add_fw_channel(message):
+    if not is_admin(message.chat.id):
+        return
+
+    payload = message.text.split(maxsplit=1)
+    if len(payload) < 2:
+        bot.send_message(message.chat.id, "Usage: /addfw Name - CHAT_ID - InviteLink\nor /addfw Name - CHAT_ID")
+        return
+
+    name, chat_id, invite_link = parse_force_channel_input(payload[1].strip())
+    if chat_id and add_force_channel(chat_id, name, invite_link):
+        bot.send_message(message.chat.id, "✅ Force-join channel added.")
+    else:
+        bot.send_message(message.chat.id, "Invalid channel reference.")
+
+
+@bot.message_handler(commands=['removefw'])
+def remove_fw_channel(message):
+    if not is_admin(message.chat.id):
+        return
+
+    payload = message.text.split(maxsplit=1)
+    if len(payload) < 2:
+        bot.send_message(message.chat.id, "Usage: /removefw CHAT_ID\nor /removefw Name - CHAT_ID")
+        return
+
+    _, chat_id, _ = parse_force_channel_input(payload[1].strip())
+    if not chat_id:
+        bot.send_message(message.chat.id, "Invalid format.")
+        return
+    remove_force_channel(chat_id)
+    bot.send_message(message.chat.id, "❌ Force-join channel removed.")
+
+
+@bot.message_handler(commands=['addvip'])
+def add_vip_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /addvip USER_ID")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    add_vip(target_id)
+    bot.send_message(message.chat.id, f"💎 VIP added: {target_id}")
+
+
+@bot.message_handler(commands=['removevip'])
+def remove_vip_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /removevip USER_ID")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except Exception:
+        bot.send_message(message.chat.id, "Invalid USER_ID.")
+        return
+
+    remove_vip(target_id)
+    bot.send_message(message.chat.id, f"❌ VIP removed: {target_id}")
+
+
+@bot.message_handler(commands=['disableforcejoin'])
+def disable_force_join_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    disable_force_join()
+    bot.send_message(message.chat.id, "❌ Force join disabled.")
+
+
+@bot.message_handler(commands=['forcejoinstatus'])
+def force_join_status(message):
+    if not is_admin(message.chat.id):
+        return
+
+    enabled = is_force_join_enabled()
+    channels = get_force_join_channels()
+    custom_message = get_force_join_message()
+    channels_text = (
+        "\n".join(
+            f"- {ch['name']} | chat_id: {ch['chat_id']} | link: {ch.get('invite_link') or 'auto'}"
+            for ch in channels
+        )
+        if channels else "None"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        f"Force Join: {'ON' if enabled else 'OFF'}\nChannels: {channels_text}\nMessage: {custom_message}"
+    )
+
+
+@bot.message_handler(commands=['setfwmsg'])
+def set_firewall_message_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.send_message(message.chat.id, "Usage: /setfwmsg Your new firewall message")
+        return
+
+    set_force_join_message(parts[1].strip())
+    bot.send_message(message.chat.id, "✅ Firewall message updated.")
+
+
+@bot.message_handler(commands=['clearfirewall'])
+def clear_firewall_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("TRUNCATE firewall_tracking")
+    
+    # Clear memory cache so the bot performs fresh checks
+    with force_join_cache_lock:
+        force_join_cache.clear()
+    
+    bot.send_message(message.chat.id, "✅ Firewall tracking table and cache have been cleared. Everyone must re-verify.")
+
+
+@bot.message_handler(commands=['maintenance'])
+def maintenance_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+    
+    parts = message.text.split()
+    if len(parts) < 2:
+        curr = "ENABLED" if is_maintenance_mode() else "DISABLED"
+        bot.send_message(message.chat.id, f"Current Maintenance Mode: **{curr}**\n\nUse `/maintenance on` or `/maintenance off`", parse_mode="Markdown")
+        return
+    
+    target = parts[1].lower()
+    if target == "on":
+        set_maintenance_mode(True)
+        bot.send_message(message.chat.id, "🚧 Maintenance mode **ENABLED**. Users are now blocked.", parse_mode="Markdown")
+    elif target == "off":
+        set_maintenance_mode(False)
+        bot.send_message(message.chat.id, "✅ Maintenance mode **DISABLED**. Users can now use the bot.", parse_mode="Markdown")
+    else:
+        bot.send_message(message.chat.id, "Invalid option. Use `on` or `off`.")
+
+
+@bot.message_handler(commands=['broadcast'])
+def broadcast_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        pending_admin_broadcast.add(message.chat.id)
+        bot.send_message(message.chat.id, "📣 Send broadcast text. Type /cancel to stop.")
+        return
+
+    sent = admin_broadcast_text(message.chat.id, parts[1].strip())
+    bot.send_message(message.chat.id, f"📣 Broadcast sent to {sent} targets.")
+
+
+@bot.message_handler(commands=['adminmenu'])
+def admin_menu(message):
+
+    if not is_admin(message.chat.id):
+        return
+
+    bot.send_message(
+        message.chat.id,
+        """
+🛠 ADMIN COMMAND MENU
+
+📊 /stats  
+→ Show bot statistics
+
+⏳ /setlimit HOURS  
+→ Set inactivity limit (hours)
+
+🎁 /setgrace HOURS  
+→ Set new user grace period (0 = none)
+
+🔎 /info USER_ID  
+→ View user details
+
+⚠ /warn (reply)  
+→ Add warning to replied user
+
+📌 /warnings (reply)  
+→ View warnings for replied user
+
+♻ /resetwarn (reply)  
+→ Reset warnings for replied user
+
+🚫 /ban USER_ID  
+→ Manually ban user
+
+✅ /unban USER_ID  
+→ Remove manual ban
+
+⭐ /whitelist USER_ID  
+→ Bypass activation/inactivity
+
+❌ /unwhitelist USER_ID  
+→ Remove whitelist access
+
+📢 /setforcejoin CHAT [message]  
+→ Enable force join and set channel
+
+➕ /addfw CHAT  
+→ Add extra force-join channel
+
+➖ /removefw CHAT  
+→ Remove force-join channel
+
+🚫 /disableforcejoin  
+→ Disable force join
+
+📋 /forcejoinstatus  
+→ Show force join configuration
+
+✏️ /setfwmsg TEXT  
+→ Update firewall message text
+
+📣 /broadcast TEXT  
+→ Send admin broadcast to active users
+
+💎 /addvip USER_ID  
+→ Add VIP bypass user
+
+❌ /removevip USER_ID  
+→ Remove VIP bypass user
+
+👑 /addadmin USER_ID  
+→ Add new admin
+
+🗑 /removeadmin USER_ID  
+→ Remove admin
+
+🚪 /openjoin  
+→ Allow new users to join
+
+🔒 /closejoin  
+→ Stop new users from joining
+
+🧹 /clearmap  
+→ Clear message mapping table
+
+🔥 /apurgeall  
+→ Delete all mapped user messages globally
+
+📦 /addword WORD  
+→ Add banned word
+
+❌ /removeword WORD  
+→ Remove banned word
+
+📃 /words  
+→ Show banned words list
+        """
+    )
+@bot.callback_query_handler(func=lambda call: call.data == "check_join")
+def check_join_callback(call):
+    user_id = call.from_user.id
+    msg = call.message
+    joined, missing = is_user_joined_detailed(user_id, force_refresh=True)
+    if joined:
+        bot.answer_callback_query(call.id, "✅ Verified!")
+        with last_fw_msg_lock:
+            last_fw_msg.pop(int(user_id), None)
+            
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
+                    VALUES (%s, TRUE, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE SET 
+                        passed_ever = TRUE, 
+                        currently_joined = TRUE
+                """, (user_id,))
+                
+                # Update main users table for historical stats
+                c.execute("UPDATE users SET passed_firewall_ever = TRUE WHERE user_id = %s", (user_id,))
+
+        try:
+            bot.edit_message_text(
+                "✅ You have joined all required channels.\n\n🎉 Access granted!",
+                chat_id=msg.chat.id,
+                message_id=msg.message_id
+            )
+        except Exception:
+            try:
+                bot.delete_message(msg.chat.id, msg.message_id)
+            except Exception:
+                pass
+            bot.send_message(user_id, "🎉 You have joined all required channels.\n\nAccess granted!")
+            
+        if not get_username(user_id):
+            bot.send_message(user_id, get_welcome_message())
+    else:
+        missing_str = "\n".join([f"• {name}" for name in missing])
+        prefix = f"⚠️ *Still missing membership in:*\n{missing_str}\n\nPlease join them and try again."
+        bot.answer_callback_query(call.id, "❌ You still need to join some channels.", show_alert=True)
+        send_force_join_ui(user_id, prefix_text=prefix)
+
+@bot.chat_member_handler()
+def handle_chat_member_update(message):
+    new_status = message.new_chat_member.status
+    user_id = message.from_user.id
+    chat_id = str(message.chat.id)
+    
+    # Check if this chat is part of the firewall
+    channels = get_force_join_channels()
+    if not any(str(ch.get("chat_id")).strip() == chat_id for ch in channels):
+        return
+
+    # Check status using force_refresh to bypass cache
+    joined, _ = is_user_joined_detailed(user_id, force_refresh=True)
+
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if joined:
+                c.execute("SELECT passed_ever FROM firewall_tracking WHERE user_id=%s", (user_id,))
+                row = c.fetchone()
+                
+                c.execute("""
+                    INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
+                    VALUES (%s, TRUE, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE SET 
+                        passed_ever = TRUE, 
+                        currently_joined = TRUE
+                """, (user_id,))
+                
+                # Update main users table for historical stats
+                c.execute("UPDATE users SET passed_firewall_ever = TRUE WHERE user_id = %s", (user_id,))
+
+                
+                if not row or not row[0]:
+                    # User passed firewall for the first time
+                    log_group = get_view_files_chat_id()
+                    username = get_username(user_id)
+                    display_name = username or "Unknown"
+                    if log_group:
+                        try:
+                            bot.send_message(log_group, f"🧱 *Firewall Passed*\nUser: `{user_id}` (@{display_name})\nSuccessfully joined required channels.", parse_mode="Markdown")
+                        except: pass
+                    
+                    if not username:
+                        try:
+                            bot.send_message(user_id, "🎉 You have joined all required channels.\n\nAccess granted!")
+                            bot.send_message(user_id, get_welcome_message())
+                        except: pass
+            else:
+                c.execute("""
+                    INSERT INTO firewall_tracking (user_id, currently_joined)
+                    VALUES (%s, FALSE)
+                    ON CONFLICT (user_id) DO UPDATE SET currently_joined = FALSE
+                """, (user_id,))
+
+@bot.chat_join_request_handler()
+def handle_join_request(request):
+    user_id = request.from_user.id
+    chat_id = str(request.chat.id)
+    username = f"@{request.chat.username}" if request.chat.username else None
+    
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            # Always store by numeric ID
+            c.execute("""
+                INSERT INTO pending_join_requests(user_id, chat_id)
+                VALUES(%s, %s)
+                ON CONFLICT (user_id, chat_id) DO NOTHING
+            """, (user_id, chat_id))
+            
+            # Also store by username if the channel has one (helps with matching)
+            if username:
+                c.execute("""
+                    INSERT INTO pending_join_requests(user_id, chat_id)
+                    VALUES(%s, %s)
+                    ON CONFLICT (user_id, chat_id) DO NOTHING
+                """, (user_id, username))
+    
+    print(f"Recorded join request from {user_id} for {chat_id} ({username or 'private'})")
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "noop")
+def noop_callback(call):
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "delete_message")
+def delete_msg_callback(call):
+    try:
+        bot.delete_message(call.message.chat.id, call.message.message_id)
+    except Exception:
+        bot.answer_callback_query(call.id, "Message already deleted or too old.")
+    bot.answer_callback_query(call.id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data in {
+    "panel_back", "panel_stats", "panel_users", "panel_firewall", "panel_system", "panel_moderation", "panel_vip", "panel_broadcast"
+})
+def panel_navigation_callbacks(call):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not admin.")
+        return
+
+    if call.data == "panel_back":
+        bot.answer_callback_query(call.id)
+        panel_text = (
+            "🎛 *CORE CONTROL CENTER*\n"
+            "Select a system module to manage:\n\n"
+            "┠ 👥 *User Management*\n"
+            "┠ 🛡️ *Firewall Controls*\n"
+            "┠ ⚙️ *System Config*\n"
+            "┠ 📊 *Bot Statistics*"
+        )
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_main_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_stats":
+        bot.answer_callback_query(call.id)
+        stats_command(call.message)
+        return
+
+    if call.data == "panel_users":
+        bot.answer_callback_query(call.id)
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT COUNT(*) FROM users")
+                total_users = c.fetchone()[0]
+                c.execute("SELECT COUNT(*) FROM users WHERE referred_by IS NOT NULL")
+                invited_users = c.fetchone()[0]
+
+        panel_text = (
+            "👥 *USER DIRECTORY*\n"
+            "────────────────────\n"
+            f"📈 Total Population: `{total_users}`\n"
+            f"✉️ Referral Network: `{invited_users}`\n"
+            "────────────────────\n"
+            "Search, filter, and moderate users."
+        )
+        
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_users_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_firewall":
+        bot.answer_callback_query(call.id)
+        enabled = is_force_join_enabled()
+        status = "🛡️ SECURED" if enabled else "🔓 BYPASSED"
+        channels = get_force_join_channels()
+        
+        panel_text = (
+            "🧱 *SECURITY GATEWAY*\n"
+            "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
+            f"🔸 Gate Status: {status}\n"
+            f"🔸 Watchlist: `{len(channels)}` channels\n"
+            "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈\n"
+            "Enforce join-requirements for access."
+        )
+        
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_firewall_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_system":
+        bot.answer_callback_query(call.id)
+        panel_text = (
+            "💻 *TERMINAL CONFIG*\n"
+            "⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼\n"
+            "> Database: `CONNECTED`\n"
+            "> Backup: `READY`\n"
+            "⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼⎼\n"
+            "Maintain core bot infrastructure."
+        )
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_system_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_moderation":
+        bot.answer_callback_query(call.id)
+        panel_text = (
+            "🚫 *MODERATION CENTER*\n"
+            "✕━━━━━━━━━━━━━━━━━━✕\n"
+            "Banning | Warnings | Filters\n"
+            "✕━━━━━━━━━━━━━━━━━━✕"
+        )
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_moderation_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_vip":
+        bot.answer_callback_query(call.id)
+        panel_text = (
+            "💎 *VIP PRIVILEGES*\n"
+            "✨━━━━━━━━━━━━━━━━━━✨\n"
+            "Manage users who bypass filters."
+        )
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_vip_markup(),
+            message_id=call.message.message_id,
+        )
+        return
+
+    if call.data == "panel_broadcast":
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("✅ Active", callback_data="bc_target:active"),
+            InlineKeyboardButton("⏳ Inactive", callback_data="bc_target:inactive")
+        )
+        markup.add(
+            InlineKeyboardButton("⚠️ Pending Setup", callback_data="bc_target:pending"),
+            InlineKeyboardButton("📸 Pending Media", callback_data="bc_target:activation")
+        )
+        markup.add(InlineKeyboardButton("🌎 All Users", callback_data="bc_target:all"))
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
+        
+        bot.edit_message_text(
+            "📣 *TARGETED BROADCAST*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Select the group of users you want to message:",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        return
+
+
+@bot.callback_query_handler(func=lambda call: call.data in {
+    "fw_on", "fw_off", "fw_add", "fw_remove", "vip_add", "vip_remove", "fw_status", "fw_edit_msg", "fw_stats"
+} or call.data.startswith("fw_view:") or call.data.startswith("fw_del:") or call.data.startswith("bc_target:") or call.data.startswith("admin_unban_user:"))
+def admin_extra_callbacks(call):
+    actor_id = call.from_user.id
+    admin_chat_id = call.message.chat.id
+    if not is_admin(actor_id):
+        bot.answer_callback_query(call.id, "Not admin.")
+        return
+
+    data = call.data
+
+    if data.startswith("bc_target:"):
+        target = data.split(":")[1]
+        pending_admin_broadcast.add(actor_id)
+        pending_admin_broadcast_target[actor_id] = target
+        bot.answer_callback_query(call.id, f"Target: {target}")
+        bot.edit_message_text(
+            f"📣 *BROADCAST TO {target.upper()}*\n\n"
+            "Please send the message you want to broadcast.\n"
+            "You can type /cancel to abort.",
+            admin_chat_id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        return
+
+    if data.startswith("admin_unban_user:"):
+        uid = int(data.split(":")[1])
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE users SET banned=FALSE, auto_banned=FALSE WHERE user_id=%s", (uid,))
+        bot.answer_callback_query(call.id, "✅ User unbanned.")
+        # Refresh profile
+        call.data = f"admin_user_info:{uid}:0:all"
+        admin_callbacks(call)
+        return
+
+    if data.startswith("admin_gift_cycle:"):
+        uid = int(data.split(":")[1])
+        grant_full_cycle(uid)
+        bot.answer_callback_query(call.id, "🎁 Full Cycle Gifted!", show_alert=True)
+        # Refresh profile
+        call.data = f"admin_user_info:{uid}:0:all"
+        admin_callbacks(call)
+        return
+    
+    # Original firewall logic follows
+    firewall_ui_callbacks(call)
+
+def firewall_ui_callbacks(call):
+    actor_id = call.from_user.id
+    admin_chat_id = call.message.chat.id
+    data = call.data
+
+    if data.startswith("fw_view:"):
+        target_id = data.split(":", 1)[1]
+        channels = get_force_join_channels()
+        target = next((ch for ch in channels if ch['chat_id'] == target_id), None)
+        
+        if not target:
+            bot.answer_callback_query(call.id, "Channel not found.")
+            return
+
+        bot.answer_callback_query(call.id)
+        text = (
+            f"📡 *Channel Details*\n\n"
+            f"📛 *Name:* {target['name']}\n"
+            f"🆔 *Chat ID:* `{target['chat_id']}`\n"
+            f"🔗 *Link:* {target['invite_link'] or 'Auto'}"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🗑 Remove Channel", callback_data=f"fw_del:{target_id}"))
+        markup.add(InlineKeyboardButton("🔙 Back to List", callback_data="fw_status"))
+        
+        bot.edit_message_text(text, admin_chat_id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    if data.startswith("fw_del:"):
+        target_id = data.split(":", 1)[1]
+        remove_force_channel(target_id)
+        bot.answer_callback_query(call.id, "✅ Channel removed.")
+        # Go back to status list
+        call.data = "fw_status"
+        firewall_ui_callbacks(call)
+        return
+
+    if call.data == "fw_on":
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute(
+                    """
+                    INSERT INTO settings(key, value)
+                    VALUES('force_join_enabled', 'true')
+                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                    """
+                )
+        refresh_caches()
+        bot.answer_callback_query(call.id, "🧱 Firewall Enabled")
+        call.data = "panel_firewall"
+        panel_navigation_callbacks(call)
+        return
+
+    if call.data == "fw_off":
+        disable_force_join()
+        refresh_caches()
+        bot.answer_callback_query(call.id, "🧱 Firewall Disabled")
+        call.data = "panel_firewall"
+        panel_navigation_callbacks(call)
+        return
+
+    if call.data == "fw_add":
+        pending_fw_add.add(actor_id)
+        bot.answer_callback_query(call.id, "Awaiting channel")
+        bot.send_message(actor_id, "📢 Send channel as:\nName - CHAT_ID - InviteLink")
+        return
+
+    if call.data == "fw_remove":
+        pending_fw_remove.add(actor_id)
+        bot.answer_callback_query(call.id, "Awaiting channel")
+        bot.send_message(actor_id, "❌ Send channel to remove")
+        return
+
+    if call.data == "vip_add":
+        pending_vip_add.add(actor_id)
+        bot.answer_callback_query(call.id, "Awaiting USER_ID")
+        bot.send_message(actor_id, "💎 Send USER_ID to add VIP")
+        return
+
+    if call.data == "vip_remove":
+        pending_vip_remove.add(actor_id)
+        bot.answer_callback_query(call.id, "Awaiting USER_ID")
+        bot.send_message(actor_id, "❌ Send USER_ID to remove VIP")
+        return
+
+    if call.data == "fw_status":
+        enabled = is_force_join_enabled()
+        channels = get_force_join_channels()
+        
+        markup = InlineKeyboardMarkup(row_width=1)
+        for ch in channels:
+            chat_id = ch['chat_id']
+            # Default to admin name
+            display_name = ch['name']
+            
+            # Try to fetch real channel title for a more professional look
+            if not any(x in chat_id for x in ["t.me/+", "t.me/joinchat/"]):
+                try:
+                    chat_ref = int(chat_id) if chat_id.lstrip("-").isdigit() else chat_id
+                    chat_info = bot.get_chat(chat_ref)
+                    if chat_info and chat_info.title:
+                        display_name = chat_info.title
+                except Exception:
+                    pass
+            
+            markup.add(InlineKeyboardButton(f"📡 {display_name}", callback_data=f"fw_view:{ch['chat_id']}"))
+        
+        markup.add(InlineKeyboardButton("🔙 Back to Firewall", callback_data="panel_firewall"))
+        
+        status_txt = "🟢 ON" if enabled else "🔴 OFF"
+        bot.answer_callback_query(call.id)
+        
+        try:
+            bot.edit_message_text(
+                f"🧱 *Firewall Status:* {status_txt}\n\nSelect a channel below to view details or remove it:",
+                chat_id=admin_chat_id,
+                message_id=call.message.message_id,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            bot.send_message(
+                admin_chat_id,
+                f"🧱 *Firewall Status:* {status_txt}\n\nSelect a channel below to view details or remove it:",
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+        return
+
+    if call.data == "fw_edit_msg":
+        pending_fw_msg.add(actor_id)
+        bot.answer_callback_query(call.id, "Awaiting message")
+        bot.send_message(actor_id, "✏️ Send new firewall message:")
+        return
+
+    if call.data == "fw_stats":
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("SELECT COUNT(*) FROM firewall_tracking WHERE msg_received=TRUE")
+                msg_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM users WHERE passed_firewall_ever=TRUE")
+                passed_count = c.fetchone()[0]
+                
+                c.execute("SELECT COUNT(*) FROM firewall_tracking WHERE currently_joined=TRUE")
+                joined_count = c.fetchone()[0]
+                
+        stats_text = (
+            "📈 *Firewall Statistics*\n\n"
+            f"📨 *Users Received Firewall Msg:* `{msg_count}`\n"
+            f"✅ *Users Passed Firewall (Historical):* `{passed_count}`\n"
+            f"🔗 *Members Currently Joined:* `{joined_count}`"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 Back to Firewall", callback_data="panel_firewall"))
+        
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text(stats_text, chat_id=admin_chat_id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("admin_"))
+def admin_callbacks(call):
+
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Not admin.")
+        return
+
+    data = call.data
+
+    if data == "admin_stats":
+        stats_command(call.message)
+
+    elif data == "admin_open_join":
+        set_join_status(True)
+        bot.answer_callback_query(call.id, "Join opened.")
+
+    elif data == "admin_close_join":
+        set_join_status(False)
+        bot.answer_callback_query(call.id, "Join closed.")
+
+    elif data == "admin_clearmap":
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("DELETE FROM message_map")
+        bot.answer_callback_query(call.id, "Message map cleared.")
+
+    elif data == "admin_setcaption":
+        pending_admin_setcaption.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting new caption")
+        bot.send_message(call.from_user.id, "📝 Send the new caption template. Type /cancel to stop.\nUse {username} to include sender name.\nUse {caption} to include original caption.\nType 'none' to clear it entirely.")
+
+    elif data == "admin_setwelcome":
+        pending_admin_setwelcome.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting welcome message")
+        bot.send_message(call.from_user.id, "👋 Send the new welcome message text. Type /cancel to abort.\nType 'none' to remove it.")
+
+    elif data == "admin_setinactive":
+        pending_admin_setinactive.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting inactive message")
+        bot.send_message(call.from_user.id, "⏳ Send the new inactive message text. Type /cancel to abort.\nType 'none' to remove it.")
+
+    elif data == "admin_addforward":
+        pending_admin_addforward.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting forward target")
+        bot.send_message(call.from_user.id, "➕ Send the CHAT_ID for the forward target. You can also forward a text message from the target channel/group here. Type /cancel to abort.")
+
+    elif data == "admin_toggle_maintenance":
+        new_status = not is_maintenance_mode()
+        set_maintenance_mode(new_status)
+        bot.answer_callback_query(call.id, f"Maintenance {'Enabled' if new_status else 'Disabled'}")
+        
+        # Refresh the system panel
+        panel_text = (
+            "⚙️ *TERMINAL CONFIG*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"> Status: `{'MAINTENANCE' if new_status else 'LIVE'}`\n"
+            "> Database: `CONNECTED`\n"
+            "> Backup: `READY`\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Maintain core bot infrastructure."
+        )
+        _panel_send_or_edit(
+            call.message.chat.id,
+            panel_text,
+            _panel_system_markup(),
+            message_id=call.message.message_id,
+        )
+
+    elif data == "admin_banned":
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT user_id FROM users WHERE banned=TRUE
+                """)
+                rows = c.fetchall()
+
+        if rows:
+            text = "\n".join(str(r[0]) for r in rows)
+        else:
+            text = "No banned users."
+
+        bot.send_message(call.message.chat.id, text)
+
+    elif data == "admin_global_gift_menu":
+        if call.from_user.id not in pending_admin_global_gift_data:
+            pending_admin_global_gift_data[call.from_user.id] = {"target": "all", "hours": 12}
+        
+        text = (
+            "🎁 *GLOBAL GIFT CONFIGURATION*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose who to gift and for how long.\n\n"
+            "🔹 *Target:* `Everyone` | `Senders` | `Newbies`\n"
+            "🔹 *Duration:* `1h` to `12h`\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Click execute to apply to the entire database."
+        )
+        bot.edit_message_text(
+            text,
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=_panel_global_gift_markup(call.from_user.id),
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("gg_target:"):
+        target = data.split(":")[1]
+        if call.from_user.id not in pending_admin_global_gift_data:
+            pending_admin_global_gift_data[call.from_user.id] = {"target": "all", "hours": 12}
+        pending_admin_global_gift_data[call.from_user.id]["target"] = target
+        bot.answer_callback_query(call.id, f"Target set to: {target}")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_panel_global_gift_markup(call.from_user.id))
+
+    elif data.startswith("gg_hours:"):
+        hours = int(data.split(":")[1])
+        if call.from_user.id not in pending_admin_global_gift_data:
+            pending_admin_global_gift_data[call.from_user.id] = {"target": "all", "hours": 12}
+        pending_admin_global_gift_data[call.from_user.id]["hours"] = hours
+        bot.answer_callback_query(call.id, f"Duration set to: {hours}h")
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_panel_global_gift_markup(call.from_user.id))
+
+    elif data == "gg_execute":
+        config = pending_admin_global_gift_data.get(call.from_user.id, {"target": "all", "hours": 12})
+        grant_global_free_cycle(target=config["target"], hours=config["hours"])
+        bot.answer_callback_query(call.id, "🚀 Global Gift Executed!", show_alert=True)
+        # Refresh panel or go back
+        call.data = "panel_moderation"
+        panel_navigation_callbacks(call)
+
+    elif data == "admin_global_gift":
+        grant_global_free_cycle()
+        bot.answer_callback_query(call.id, "🎁 Everyone received a free cycle!", show_alert=True)
+
+    elif data.startswith("admin_userlist"):
+        bot.answer_callback_query(call.id)
+        try:
+            bot.edit_message_text("🔄 Fetching user data (this may take a few seconds)...", call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        
+        parts = data.split(":")
+        page = int(parts[1]) if len(parts) > 1 else 0
+        filter_type = parts[2] if len(parts) > 2 else "all"
+        limit = 10
+        offset = page * limit
+        
+        import math
+        import time
+        now = int(time.time())
+        
+        query_condition = "u.username IS NOT NULL"
+        query_params = []
+        having_clause = ""
+        
+        if filter_type == "active":
+            query_condition += " AND last_activation_time >= %s"
+            query_params.append(now - get_inactivity_limit())
+        elif filter_type == "dead":
+            query_condition += " AND u.total_media_sent = 0"
+        elif filter_type == "refs":
+            having_clause = "HAVING COUNT(r.user_id) > 0"
+            
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                if filter_type == "refs":
+                    c.execute(f"""
+                        SELECT COUNT(*) FROM (
+                            SELECT u.user_id FROM users u
+                            LEFT JOIN users r ON r.referred_by = u.user_id
+                            WHERE {query_condition}
+                            GROUP BY u.user_id
+                            {having_clause}
+                        ) sub
+                    """, tuple(query_params))
+                else:
+                    c.execute(f"SELECT COUNT(*) FROM users u WHERE {query_condition}", tuple(query_params))
+                total_users = c.fetchone()[0]
+                
+                query_params.extend([limit, offset])
+                c.execute(f"""
+                    SELECT u.user_id, u.username, u.total_media_sent, COUNT(r.user_id), u.last_activation_time
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE {query_condition}
+                    GROUP BY u.user_id, u.username, u.total_media_sent, u.last_activation_time
+                    {having_clause}
+                    ORDER BY u.total_media_sent DESC
+                    LIMIT %s OFFSET %s
+                """, tuple(query_params))
+                rows = c.fetchall()
+        
+        filter_labels = {"all": "All Users", "active": "Active Only", "dead": "0 Uploads", "refs": "Refs > 0"}
+        text = f"👥 *User List ({filter_labels.get(filter_type, 'All')})*\nSelect a user to view details."
+            
+        markup = InlineKeyboardMarkup(row_width=1)
+        if rows:
+            for row in rows:
+                uid, fallback, media, refs, last_active = row[0], row[1], row[2], row[3], row[4]
+                
+                if last_active:
+                    time_passed = now - last_active
+                    time_left = max(0, get_inactivity_limit() - time_passed)
+                    status = f"🟢 {time_left // 3600}h" if time_left > 0 else "🔴"
+                else:
+                    status = "🔴"
+                    
+                display_name = f"@{fallback}"
+                try:
+                    chat = bot.get_chat(uid)
+                    if chat.username:
+                        display_name = f"@{chat.username}"
+                    else:
+                        full = f"{chat.first_name or ''} {chat.last_name or ''}".strip()
+                        if full: display_name = full
+                except Exception:
+                    pass
+                
+                btn_text = f"{display_name} | {status} | 📸 {media}"
+                markup.add(InlineKeyboardButton(btn_text, callback_data=f"admin_user_info:{uid}:{page}:{filter_type}"))
+        else:
+            text = "No users found matching this filter."
+            
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_userlist:{page - 1}:{filter_type}"))
+            
+        total_pages = math.ceil(total_users / limit) if total_users > 0 else 1
+        nav_buttons.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="ignore_pagination"))
+        
+        if offset + limit < total_users:
+            nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_userlist:{page + 1}:{filter_type}"))
+            
+        if nav_buttons:
+            markup.row(*nav_buttons)
+            
+        markup.add(InlineKeyboardButton("🔙 Back to Tools", callback_data="panel_users"))
+        
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            try:
+                bot.send_message(call.message.chat.id, text, parse_mode="Markdown", reply_markup=markup)
+            except Exception:
+                pass
+        return
+
+    elif data.startswith("admin_user_info:"):
+        bot.answer_callback_query(call.id)
+        parts = data.split(":")
+        uid = int(parts[1])
+        page = parts[2] if len(parts) > 2 else "0"
+        filter_type = parts[3] if len(parts) > 3 else "all"
+        
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
+                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.user_id = %s
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                """, (uid,))
+                row = c.fetchone()
+        
+        if not row:
+            bot.answer_callback_query(call.id, "User not found.", show_alert=True)
+            return
+            
+        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username, is_banned_user = row
+        import datetime, time
+        now = int(time.time())
+        joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
+        
+        status_str = "🔴 BANNED" if is_banned_user else "🔴 Inactive"
+        if not is_banned_user and last_active:
+            time_passed = now - last_active
+            time_left = max(0, get_inactivity_limit() - time_passed)
+            if time_left > 0:
+                status_str = f"🟢 {time_left // 3600}h {(time_left % 3600) // 60}m"
+            
+        rep_emoji = {"Trusted": "👑", "Neutral": "👤", "Suspicious": "⚠️", "Scammer": "🚫"}.get(reputation, "👤")
+        full_name = f"{first_name or ''} {last_name or ''}".strip() or "Anonymous"
+        display_tg_user = f"@{tg_username}" if tg_username else "No Username"
+        
+        text = (
+            f"👤 *USER PROFILE*\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔸 *Telegram Name:* `{escape_markdown(full_name)}`\n"
+            f"🔸 *Username:* `{escape_markdown(display_tg_user)}`\n"
+            f"🔸 *Bot ID Name:* `{escape_markdown(bot_username or 'Not Set')}`\n"
+            f"🔸 *User ID:* `{uid}`\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📊 *STATISTICS*\n"
+            f"📸 *Total Uploads:* `{media}`\n"
+            f"👥 *Total Referrals:* `{refs}`\n"
+            f"⏱ *Current Status:* {status_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷 *Reputation:* {rep_emoji} *{reputation}*\n"
+            f"📅 *Join Date:* `{joined_str}`\n\n"
+            f"📝 *ADMIN NOTES:*\n"
+            f"_{escape_markdown(notes or 'No administrative notes recorded.')}_"
+        )
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{uid}"),
+            InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{uid}")
+        )
+        
+        if tg_username:
+            markup.add(
+                InlineKeyboardButton("👤 Direct DM", url=f"https://t.me/{tg_username}"),
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
+            )
+        else:
+            markup.add(
+                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
+            )
+        
+        ban_btn = InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_user:{uid}") if is_banned_user else InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}")
+
+        markup.add(
+            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{uid}"),
+            ban_btn
+        )
+        markup.add(
+            InlineKeyboardButton("🎁 Gift Cycle", callback_data=f"admin_gift_cycle:{uid}"),
+            InlineKeyboardButton("🔙 Close", callback_data="delete_message")
+        )
+        
+        try:
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        except Exception:
+            pass
+        return
+
+    elif data == "admin_search_user":
+        pending_admin_search_user.add(call.from_user.id)
+        bot.answer_callback_query(call.id, "Awaiting query")
+        bot.send_message(call.message.chat.id, "🔍 Send username or exact User ID to search:\n(Type /cancel to abort)")
+        return
+
+    elif data.startswith("admin_ban_user:"):
+        uid = int(data.split(":")[1])
+        ban_user(uid)
+        bot.answer_callback_query(call.id, "🚫 User Banned!", show_alert=True)
+        # Refresh profile
+        call.data = f"admin_user_info:{uid}:0:all"
+        admin_callbacks(call)
+        return
+
+    elif data.startswith("admin_show_reps:"):
+        uid = int(data.split(":")[1])
+        markup = InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            InlineKeyboardButton("🟢 Trusted", callback_data=f"admin_set_rep:{uid}:Trusted"),
+            InlineKeyboardButton("⚪ Neutral", callback_data=f"admin_set_rep:{uid}:Neutral")
+        )
+        markup.add(
+            InlineKeyboardButton("🟡 Suspicious", callback_data=f"admin_set_rep:{uid}:Suspicious"),
+            InlineKeyboardButton("🔴 Scammer", callback_data=f"admin_set_rep:{uid}:Scammer")
+        )
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_info:{uid}"))
+        bot.edit_message_text("Select user reputation label:", call.message.chat.id, call.message.message_id, reply_markup=markup)
+        return
+
+    elif data.startswith("admin_set_rep:"):
+        _, _, uid, label = data.split(":")
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("UPDATE users SET reputation = %s WHERE user_id = %s", (label, int(uid)))
+        bot.answer_callback_query(call.id, f"Reputation set to {label}")
+        return
+
+    elif data.startswith("admin_start_note:"):
+        uid = int(data.split(":")[1])
+        pending_admin_set_note[call.from_user.id] = uid
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "📝 Send the private note for this user:\n(Type /cancel to abort)")
+        return
+
+    elif data.startswith("admin_msg_user:"):
+        uid = int(data.split(":")[1])
+        pending_admin_msg_target[call.from_user.id] = uid
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "✉️ Send the message you want to deliver to this user:\n(Type /cancel to abort)")
+        return
+
+    elif data.startswith("admin_view_files:"):
+        uid = int(data.split(":")[1])
+        target_chat = get_view_files_chat_id()
+        
+        markup = InlineKeyboardMarkup(row_width=2)
+        
+        if target_chat:
+            markup.add(
+                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot:0"),
+                InlineKeyboardButton("📁 Send to Group", callback_data=f"admin_view_files_dest:{uid}:group:0")
+            )
+            text = "📂 *Where would you like to view the files?*"
+        else:
+            markup.add(
+                InlineKeyboardButton("📥 Send to Bot", callback_data=f"admin_view_files_dest:{uid}:bot:0"),
+                InlineKeyboardButton("⚙️ Set Log Group", callback_data="admin_setviewchat_prompt")
+            )
+            text = "📂 *Log group not set.*\nWould you like to view them here or configure a group to avoid spam?"
+            
+        markup.add(InlineKeyboardButton("🔙 Back", callback_data=f"admin_user_info:{uid}"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+        return
+
+    elif data.startswith("admin_view_files_dest:"):
+        parts = data.split(":")
+        uid = int(parts[1])
+        dest = parts[2] # "bot" or "group"
+        offset = int(parts[3]) if len(parts) > 3 else 0
+        
+        bot.answer_callback_query(call.id, "Fetching batch...")
+        
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                # Use subquery with ROW_NUMBER to get unique original messages
+                c.execute("""
+                    SELECT receiver_id, bot_message_id
+                    FROM (
+                        SELECT receiver_id, bot_message_id, created_at,
+                               ROW_NUMBER() OVER(PARTITION BY original_message_id ORDER BY created_at DESC) as rn
+                        FROM message_map
+                        WHERE original_user_id = %s
+                    ) t
+                    WHERE rn = 1
+                    ORDER BY created_at DESC
+                    LIMIT 15 OFFSET %s
+                """, (uid, offset))
+                files = c.fetchall()
+                
+                # Correct count of unique media sent by this user
+                c.execute("SELECT COUNT(DISTINCT original_message_id) FROM message_map WHERE original_user_id=%s", (uid,))
+                total_files = c.fetchone()[0]
+                
+        if not files and offset == 0:
+            bot.send_message(call.message.chat.id, "❌ No files found for this user.")
+            return
+
+        target_chat_id = call.message.chat.id
+        if dest == "group":
+            target_chat_id = get_view_files_chat_id()
+            if not target_chat_id:
+                bot.send_message(call.message.chat.id, "❌ Log group not found. Reverting to bot.")
+                target_chat_id = call.message.chat.id
+            else:
+                try:
+                    bot.get_chat(target_chat_id)
+                except Exception:
+                    set_view_files_chat_id(None)
+                    bot.send_message(call.message.chat.id, "⚠️ Log group inaccessible. Setting removed.")
+                    return
+
+        if offset == 0:
+            bot.send_message(target_chat_id, f"📂 *Batch 1* (Most Recent) for User ID: `{uid}`", parse_mode="Markdown")
+        else:
+            bot.send_message(target_chat_id, f"📂 *Next Batch* (Offset: {offset}) for User ID: `{uid}`", parse_mode="Markdown")
+
+        for rec_id, msg_id in files:
+            try:
+                bot.forward_message(target_chat_id, rec_id, msg_id)
+            except Exception:
+                pass
+        
+        # Add "Load More" button if there are more files
+        if offset + 15 < total_files:
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("➕ Load More Files", callback_data=f"admin_view_files_dest:{uid}:{dest}:{offset+15}"))
+            bot.send_message(target_chat_id, f"✅ Showed {offset + len(files)} / {total_files} files.", reply_markup=markup)
+        else:
+            bot.send_message(target_chat_id, f"🏁 All {total_files} files have been displayed.")
+            
+        return
+
+    elif data == "admin_setviewchat_prompt":
+        bot.answer_callback_query(call.id)
+        bot.send_message(call.message.chat.id, "⚙️ *To set a log group:* \n\n1. Go to the group/channel.\n2. Forward any message from it to this bot.\n3. Type `/setviewchat [Chat ID]` using the ID provided by the bot.", parse_mode="Markdown")
+        return
+
+    elif data == "admin_setlimit":
+        curr = get_inactivity_limit() // 3600
+        bot.send_message(call.message.chat.id, f"📝 The current inactivity limit is *{curr} hours*.\n\nTo change it, type:\n`/setlimit HOURS`\n\nExample: `/setlimit 12`", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+
+    elif data == "admin_setgrace":
+        curr = get_new_user_grace_hours()
+        bot.send_message(call.message.chat.id, f"🎁 The current new user grace period is *{curr} hours*.\n\nTo change it, type:\n`/setgrace HOURS`\n\nSet to 0 to make users send 12 media immediately upon joining.", parse_mode="Markdown")
+        bot.answer_callback_query(call.id)
+        return
+
+    elif data == "admin_leaderboards_menu":
+        bot.answer_callback_query(call.id)
+        markup = InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            InlineKeyboardButton("🏆 Referral Leaderboard", callback_data="admin_leaderboard"),
+            InlineKeyboardButton("📸 Upload Leaderboard", callback_data="admin_uploader_leaderboard"),
+            InlineKeyboardButton("🔙 Back to Users", callback_data="panel_users")
+        )
+        bot.edit_message_text("🏆 *Select Leaderboard Type*", call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        return
+
+    elif data == "admin_leaderboard":
+        bot.answer_callback_query(call.id, "Fetching leaderboard...")
+        with get_connection() as conn:
+            with conn.cursor() as c:
+                c.execute("""
+                    SELECT u.user_id, u.username, u.tg_username, u.first_name, u.last_name, COUNT(r.user_id) as refs
+                    FROM users u
+                    LEFT JOIN users r ON r.referred_by = u.user_id
+                    WHERE u.username IS NOT NULL OR u.first_name IS NOT NULL
+                    GROUP BY u.user_id, u.username, u.first_name, u.last_name
+                    HAVING COUNT(r.user_id) > 0
+                    ORDER BY refs DESC
+                    LIMIT 20
+                """)
+                rows = c.fetchall()
+        
+        if rows:
+            lines = ["🏆 *Top Referrers Leaderboard*", ""]
+            for i, row in enumerate(rows, 1):
+                uid, bot_username, tg_username, fname, lname, refs = row
+                
+                if tg_username:
+                    display_name = f"@{escape_markdown(tg_username)}"
+                elif bot_username:
+                    display_name = escape_markdown(bot_username)
+                else:
+                    full = f"{fname or ''} {lname or ''}".strip()
+                    display_name = escape_markdown(full) or f"User {uid}"
+                    
+                lines.append(f"{i}. {display_name} - *{refs}* invites")
+            text = "\n".join(lines)
+        else:
+            text = "No referrals yet."
+            
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🔙 Back to Leaderboards", callback_data="admin_leaderboards_menu"))
+        bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        return
+
+    elif data == "admin_uploader_leaderboard":
+        bot.answer_callback_query(call.id, "Fetching upload leaderboard...")
+        try:
+            with get_connection() as conn:
+                with conn.cursor() as c:
+                    c.execute("""
+                        SELECT user_id, username, tg_username, first_name, last_name, total_media_sent
+                        FROM users
+                        WHERE total_media_sent IS NOT NULL AND total_media_sent > 0
+                        ORDER BY total_media_sent DESC
+                        LIMIT 20
+                    """)
+                    rows = c.fetchall()
+            
+            if rows:
+                lines = ["📸 *Top Uploaders Leaderboard*", ""]
+                for i, row in enumerate(rows, 1):
+                    uid, bot_username, tg_username, fname, lname, uploads = row
+                    
+                    if tg_username:
+                        display_name = f"@{escape_markdown(tg_username)}"
+                    elif bot_username:
+                        display_name = escape_markdown(bot_username)
+                    else:
+                        full = f"{fname or ''} {lname or ''}".strip()
+                        display_name = escape_markdown(full) or f"User {uid}"
+                        
+                    lines.append(f"{i}. {display_name} - *{uploads}* uploads")
+                text = "\n".join(lines)
+            else:
+                text = "No uploads yet."
+                
+            markup = InlineKeyboardMarkup()
+            markup.add(InlineKeyboardButton("🔙 Back to Leaderboards", callback_data="admin_leaderboards_menu"))
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode="Markdown", reply_markup=markup)
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"❌ Error loading uploader leaderboard: {e}")
+        return
+
+    elif data == "admin_export_recovery":
+        payload = export_recovery_payload()
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+                temp_path = f.name
+            with open(temp_path, "rb") as doc:
+                bot.send_document(call.message.chat.id, doc, caption="Recovery export (username+banned+banned_words)")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    elif data == "admin_import_recovery":
+        bot.answer_callback_query(call.id, "Awaiting recovery file...")
+        pending_recovery_import.add(call.from_user.id)
+        bot.send_message(call.from_user.id, "📁 Please send the recovery JSON file as a **Document**. \n\nType `/cancel` to abort.")
+
+    bot.answer_callback_query(call.id)
+
+
+
+
+
+@bot.message_handler(commands=['setviewchat'])
+def set_view_chat_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /setviewchat CHAT_ID\nType 'none' to show files here in the bot instead.")
+        return
+    val = parts[1].strip()
+    if val.lower() == 'none':
+        set_view_files_chat_id(None)
+        bot.send_message(message.chat.id, "✅ Log group cleared. Files will now be shown here.")
+    else:
+        set_view_files_chat_id(val)
+        bot.send_message(message.chat.id, f"✅ Log group for viewing files updated to: `{val}`", parse_mode="Markdown")
+
+
+@bot.message_handler(commands=['msg'])
+def admin_direct_message(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3 or not parts[1].isdigit():
+        bot.send_message(message.chat.id, "❌ Usage: `/msg USER_ID Your Message Here`", parse_mode="Markdown")
+        return
+    
+    uid = int(parts[1])
+    text = parts[2]
+    try:
+        bot.send_message(uid, f"✉️ *Message from Admin:*\n\n{text}", parse_mode="Markdown")
+        bot.send_message(message.chat.id, f"✅ Message sent to `{uid}`.")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Failed to send: {e}")
+
+@bot.message_handler(commands=['chatid'], content_types=['text'])
+def get_chat_id(message):
+    bot.reply_to(message, f"Chat ID: {message.chat.id}")
+@bot.channel_post_handler(commands=['cchatid'])
+def get_channel_id(message):
+    bot.send_message(message.chat.id, f"Channel ID: {message.chat.id}")
+
+@bot.message_handler(commands=['setmediacaption'])
+def set_media_caption_cmd(message):
+    if not is_admin(message.chat.id):
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.send_message(message.chat.id, "Usage: /setmediacaption [Your custom caption]\nProvide 'none' to remove.\nUse {username} to include sender name.\nUse {caption} to include original caption.")
+        return
+    val = parts[1].strip()
+    if val.lower() == 'none':
+        val = ""
+    set_media_caption(val)
+    bot.send_message(message.chat.id, f"✅ Media caption updated to: {val}")
+
+# =========================
+# 🎁 REFERRAL SYSTEM
+# =========================
+
+def set_referred_by(user_id, referrer_id):
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET referred_by=%s WHERE user_id=%s",
+                (referrer_id, user_id)
+            )
+
+def add_referral_bonus(referrer_id):
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users
+                SET last_activation_time = GREATEST(%s - %s, COALESCE(last_activation_time, 0)) + 3600,
+                    auto_banned = FALSE,
+                    activation_media_count = 0
+                WHERE user_id=%s
+            """, (now, get_inactivity_limit(), referrer_id))
+
+@bot.message_handler(commands=['menu'])
+def menu_command(message):
+    user_id = message.chat.id
+    if is_banned(user_id):
+        bot.send_message(user_id, "🚫 You are banned.")
+        return
+
+    now = int(time.time())
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            c.execute("SELECT COUNT(*) FROM users WHERE referred_by=%s", (user_id,))
+            invites = c.fetchone()[0]
+            
+            c.execute("SELECT last_activation_time, joined_at, total_media_sent, username FROM users WHERE user_id=%s", (user_id,))
+            row = c.fetchone()
+            
+    if row:
+        last_act, joined_at, total_media_sent, db_username = row
+        time_left = max(0, (last_act + get_inactivity_limit()) - now) if last_act else 0
+    else:
+        joined_at, total_media_sent, db_username, time_left = None, 0, None, 0
+
+    hours = time_left // 3600
+    minutes = (time_left % 3600) // 60
+    
+    import datetime
+    join_date_str = datetime.datetime.fromtimestamp(joined_at).strftime('%Y-%m-%d %H:%M') if joined_at else "N/A"
+    display_name = f"@{db_username}" if db_username else (message.from_user.username or message.from_user.first_name)
+
+    bot.send_message(
+        user_id,
+        f"📊 *YOUR DASHBOARD*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 *User:* `{escape_markdown(display_name)}`\n"
+        f"🆔 *ID:* `{user_id}`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📸 *Media Shared:* `{total_media_sent}`\n"
+        f"👥 *Users Invited:* `{invites}`\n"
+        f"⏳ *Activity Time:* `{hours}h {minutes}m`\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 *Join Date:* `{join_date_str}`\n\n"
+        f"🎁 Use /referral to get your invite link and earn more time (1 invite = +1 hour)!",
+        parse_mode="Markdown"
+    )
+
+# =========================
+# 🌐 RENDER HEALTH CHECK
+# =========================
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Bot is alive!")
+
+    def log_message(self, format, *args):
+        # Silence logging to keep console clean
+        return
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle health checks in separate threads to prevent blocking."""
+    pass
+
+def run_health_check_server():
+    try:
+        port = int(os.getenv("PORT", "8080"))
+        server = ThreadedHTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        print(f"✅ Health check server listening on 0.0.0.0:{port} (Threaded)")
+        server.serve_forever()
+    except Exception as e:
+        print(f"❌ Health check server failed: {e}")
+
+# =========================
+# 🚀 MAIN BOOT
+# =========================
+
+if __name__ == "__main__":
+
+    # 1. Start Render Health Check Server IMMEDIATELY
+    threading.Thread(target=run_health_check_server, daemon=True).start()
+
+    print("Starting bot...")
+
+    init_db_pool()
+    init_db()
+    refresh_caches()
+    print("Database ready and cache warmed.")
+
+    start_background_workers()
+    print("Background workers running.")
+
+    # Safety delay to allow old instances to shut down on Render
+    print("Waiting 10s for session clearance and port stabilization...")
+    time.sleep(10)
+    
+    try:
+        print("Cleaning up old webhooks...")
+        bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        print(f"Webhook cleanup note: {e}")
+
+    print("Bot is now polling...")
+    while True:
+        try:
+            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 429:
+                # Respect Telegram's retry_after duration
+                retry_after = int(e.result_json.get('parameters', {}).get('retry_after', 30))
+                print(f"⚠️ Rate limited! Sleeping for {retry_after} seconds...")
+                time.sleep(retry_after + 1)
+            else:
+                print(f"Telegram API Error: {e}")
+                time.sleep(15)
+        except Exception as e:
+            print(f"Polling error: {e}")
+            time.sleep(15)
+
