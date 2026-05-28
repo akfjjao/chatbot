@@ -12,11 +12,6 @@ import random
 from contextlib import contextmanager
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-import requests
-import psycopg2
-from psycopg2 import pool as pg_pool
 
 def escape_markdown(text):
     if not text:
@@ -30,7 +25,7 @@ from psycopg2 import pool as pg_pool
 from psycopg2.extras import execute_values
 import requests
 import telebot
-from telebot.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio, InputMediaAnimation
+from telebot.types import InputMediaPhoto, InputMediaVideo
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
@@ -81,12 +76,10 @@ MAP_RETENTION_DAYS = int(os.getenv("MAP_RETENTION_DAYS", "2"))
 MAP_CLEANUP_INTERVAL_SECONDS = int(os.getenv("MAP_CLEANUP_INTERVAL_SECONDS", "300"))
 MAP_INSERT_BATCH_SIZE = int(os.getenv("MAP_INSERT_BATCH_SIZE", "1000"))
 MAP_DELETE_BATCH_SIZE = int(os.getenv("MAP_DELETE_BATCH_SIZE", "1000"))
-MAP_MAX_SIZE = int(os.getenv("MAP_MAX_SIZE", "500000"))  # Auto-purge oldest rows above this limit
-DB_BACKUP_INTERVAL_HOURS = int(os.getenv("DB_BACKUP_INTERVAL_HOURS", "1"))  # Auto-send DB backup every N hours
 MAX_WARNINGS = int(os.getenv("MAX_WARNINGS", "3"))
 WARNING_COOLDOWN = int(os.getenv("WARNING_COOLDOWN", "30"))
 WARNING_EXPIRY = int(os.getenv("WARNING_EXPIRY", "86400"))
-FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "3600"))  # Cache join status for 1 hour default
+FORCE_JOIN_CACHE_TTL = int(os.getenv("FORCE_JOIN_CACHE_TTL", "30"))
 JOINED_STATUSES = ("member", "administrator", "creator", "owner", "restricted")
 FORCE_JOIN_REMINDER_COOLDOWN = int(os.getenv("FORCE_JOIN_REMINDER_COOLDOWN", "60"))
 
@@ -99,8 +92,6 @@ bot = telebot.TeleBot(BOT_TOKEN)
 broadcast_queue = queue.Queue(maxsize=BROADCAST_QUEUE_SIZE)
 media_groups = defaultdict(list)
 album_timers = {}
-last_album_time = {}
-album_lock = threading.Lock()
 activation_buffer = defaultdict(int)
 activation_timer = {}
 activation_lock = threading.Lock()
@@ -124,14 +115,13 @@ pending_admin_addforward = set()
 pending_admin_search_user = set()
 pending_admin_msg_target = {} # admin_id -> target_user_id
 pending_admin_set_note = {}   # admin_id -> target_user_id
-pending_admin_global_gift_data = {} # admin_id -> {"target": "all", "hours": 12}
-pending_name_change = set()  # user_id
 force_join_cache_lock = threading.Lock()
 force_join_cache = {}
 force_join_reminder_lock = threading.Lock()
 force_join_reminder_at = {}
 last_fw_msg_lock = threading.Lock()
 last_fw_msg = {}
+admin_state_lock = threading.Lock()
 
 # =========================
 # ⚡ GLOBAL CACHE
@@ -139,7 +129,6 @@ last_fw_msg = {}
 cache_lock = threading.Lock()
 cached_admins = set()
 cached_vips = set()
-cached_whitelisted = set()
 cached_force_join = False
 
 def refresh_caches():
@@ -153,10 +142,6 @@ def refresh_caches():
             # Refresh VIPs
             c.execute("SELECT user_id FROM vip_users")
             new_vips = {row[0] for row in c.fetchall()}
-
-            # Refresh Whitelisted
-            c.execute("SELECT user_id FROM users WHERE whitelisted = TRUE")
-            new_whitelisted = {row[0] for row in c.fetchall()}
             
             # Refresh Force Join Status
             c.execute("SELECT value FROM settings WHERE key='force_join_enabled'")
@@ -168,11 +153,9 @@ def refresh_caches():
         cached_admins.update(new_admins)
         cached_vips.clear()
         cached_vips.update(new_vips)
-        cached_whitelisted.clear()
-        cached_whitelisted.update(new_whitelisted)
         cached_force_join = new_fj
     
-    print(f"⚡ Cache refreshed: {len(cached_admins)} admins, {len(cached_vips)} VIPs, {len(cached_whitelisted)} whitelisted, Firewall: {'ON' if new_fj else 'OFF'}")
+    print(f"⚡ Cache refreshed: {len(cached_admins)} admins, {len(cached_vips)} VIPs, Firewall: {'ON' if new_fj else 'OFF'}")
 
 # =========================
 # 🗄 DATABASE CONNECTION
@@ -194,38 +177,54 @@ def get_connection():
     global db_pool
     conn = None
     use_pool = False
+    is_broken = False
     
     try:
         if db_pool is not None:
-            try:
-                conn = db_pool.getconn()
-                use_pool = True
-                # Quick health check for the connection
-                with conn.cursor() as c:
-                    c.execute("SELECT 1")
-            except Exception:
-                # Connection might be stale, try to get a fresh one or re-init
-                if conn:
-                    db_pool.putconn(conn, close=True)
-                init_db_pool()
-                conn = db_pool.getconn()
-                use_pool = True
-        else:
+            # Resilient connection acquisition with retries for high-concurrency safety
+            for attempt in range(3):
+                try:
+                    conn = db_pool.getconn()
+                    use_pool = True
+                    # Quick lightweight check to verify if the connection is alive
+                    if conn.closed:
+                        db_pool.putconn(conn, close=True)
+                        conn = None
+                        continue
+                    break
+                except pg_pool.PoolError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+        
+        # Fallback if pool is disabled or fails to initialize
+        if conn is None:
             conn = psycopg2.connect(DATABASE_URL)
             use_pool = False
 
         yield conn
         conn.commit()
     except Exception as e:
+        is_broken = True
         if conn:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except Exception:
+                pass
         raise e
     finally:
         if conn:
             if use_pool:
-                db_pool.putconn(conn)
+                try:
+                    # Explicitly close and discard connection from the pool if it raised an exception
+                    db_pool.putconn(conn, close=is_broken)
+                except Exception:
+                    pass
             else:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 # =========================
 # 🧱 DATABASE INITIALIZATION
 # =========================
@@ -300,7 +299,7 @@ def init_db():
             """)
             c.execute("""
                 ALTER TABLE users
-                ADD COLUMN IF NOT EXISTS passed_firewall_ever BOOLEAN DEFAULT FALSE
+                ADD COLUMN IF NOT EXISTS referred_by BIGINT
             """)
 
             # =========================
@@ -671,67 +670,6 @@ def add_user(user_id, first_name=None, last_name=None, tg_username=None):
                     last_name = EXCLUDED.last_name,
                     tg_username = EXCLUDED.tg_username
             """, (user_id, free_activation_time, now, first_name, last_name, tg_username))
-
-def grant_full_cycle(user_id):
-    now = int(time.time())
-    limit = get_inactivity_limit()
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("SELECT last_activation_time FROM users WHERE user_id=%s", (user_id,))
-            row = c.fetchone()
-            if not row:
-                return
-            last_time = row[0]
-            
-            # If inactive, set to now (full cycle starts now)
-            if last_time is None or last_time < now - limit:
-                new_last_time = now
-            else:
-                # If active, add the full limit to existing time
-                new_last_time = last_time + limit
-                
-            c.execute("""
-                UPDATE users
-                SET last_activation_time = %s,
-                    auto_banned = FALSE
-                WHERE user_id=%s
-            """, (new_last_time, user_id))
-
-def grant_global_free_cycle(target="all", hours=12):
-    now = int(time.time())
-    limit = get_inactivity_limit()
-    
-    # bonus_seconds = how much time we are adding
-    bonus_seconds = hours * 3600
-    
-    # Determine the WHERE clause based on target
-    where_clause = ""
-    if target == "senders":
-        where_clause = " AND total_media_sent > 0"
-    elif target == "non_senders":
-        where_clause = " AND total_media_sent = 0"
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            # Step 1: Reactivate Inactive (those who have expired)
-            # We set them up so they have 'bonus_seconds' remaining from 'now'
-            new_inactive_time = now - limit + bonus_seconds
-            
-            c.execute(f"""
-                UPDATE users
-                SET last_activation_time = %s,
-                    auto_banned = FALSE
-                WHERE (last_activation_time IS NULL OR last_activation_time < %s)
-                {where_clause}
-            """, (new_inactive_time, now - limit))
-            
-            # Step 2: Extend Active (those who still have time)
-            c.execute(f"""
-                UPDATE users
-                SET last_activation_time = last_activation_time + %s
-                WHERE last_activation_time >= %s
-                {where_clause}
-            """, (bonus_seconds, now - limit))
 
 # =========================
 # 🏷 USERNAME HELPERS
@@ -1139,18 +1077,18 @@ def is_maintenance_mode():
             row = c.fetchone()
             return row and row[0] == "true"
 
-def get_maintenance_message():
-    return "🚧 *System Maintenance* 🚧\n\nThe bot is currently undergoing scheduled maintenance to improve performance. Please check back in a few minutes.\n\nThank you for your patience! 🙏"
 
 def set_maintenance_mode(status: bool):
-    val = "true" if status else "false"
     with get_connection() as conn:
         with conn.cursor() as c:
-            c.execute("""
-                INSERT INTO settings (key, value)
-                VALUES ('maintenance_mode', %s)
-                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """, (val,))
+            c.execute(
+                """
+                INSERT INTO settings(key, value)
+                VALUES('maintenance_mode', %s)
+                ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                """,
+                ("true" if status else "false",),
+            )
 
 def get_media_caption():
     with get_connection() as conn:
@@ -1436,7 +1374,7 @@ def parse_force_channel_input(text):
 
 
 def is_user_joined_detailed(user_id, force_refresh=False):
-    if is_admin(user_id) or is_vip(user_id) or is_whitelisted(user_id):
+    if is_admin(user_id) or is_vip(user_id):
         return True, []
 
     channels = get_force_join_channels()
@@ -1448,25 +1386,10 @@ def is_user_joined_detailed(user_id, force_refresh=False):
     cache_key = (channels_key, int(user_id))
 
     if not force_refresh:
-        # 1. Check Memory Cache
         with force_join_cache_lock:
             cached = force_join_cache.get(cache_key)
             if cached and (now - cached[1]) < FORCE_JOIN_CACHE_TTL:
                 return cached[0], []
-        
-        # 2. Check Database Cache (More persistent than memory)
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT currently_joined FROM firewall_tracking WHERE user_id=%s", (user_id,))
-                    row = c.fetchone()
-                    if row and row[0]:
-                        # Update memory cache from DB
-                        with force_join_cache_lock:
-                            force_join_cache[cache_key] = (True, now)
-                        return True, []
-        except Exception as e:
-            print(f"Firewall DB check error: {e}")
 
     # Get all pending join requests for this user at once
     with get_connection() as conn:
@@ -1474,12 +1397,9 @@ def is_user_joined_detailed(user_id, force_refresh=False):
             c.execute("SELECT chat_id FROM pending_join_requests WHERE user_id=%s", (user_id,))
             pending_chats = {row[0] for row in c.fetchall()}
 
-    channels_to_check = []
-    missing_channels = []
-
+    verifiable_channels = []
     for channel in channels:
         chat_id = str(channel.get("chat_id", "")).strip()
-        c_name = str(channel.get("name") or chat_id)
         if not chat_id:
             continue
             
@@ -1487,38 +1407,39 @@ def is_user_joined_detailed(user_id, force_refresh=False):
         if chat_id in pending_chats:
             continue
             
-        # Fail closed on non-verifiable links
+        # Skip non-verifiable links
         if any(x in chat_id for x in ["t.me/+", "t.me/joinchat/", "/joinchat/", "t.me/c/"]):
-            missing_channels.append(f"{c_name} (⚠️ Bot Misconfigured)")
             continue
             
-        channels_to_check.append(channel)
+        verifiable_channels.append(channel)
 
-    if channels_to_check:
-        def check_channel(channel):
-            c_id = str(channel.get("chat_id")).strip()
-            c_name = str(channel.get("name") or c_id)
-            c_ref = int(c_id) if c_id.lstrip("-").isdigit() else c_id
-            
-            try:
-                member = bot.get_chat_member(c_ref, user_id)
-                if member.status in JOINED_STATUSES:
-                    return None
-                return c_name
-            except Exception as e:
-                # Provide the exact error for debugging
-                err_msg = str(e).replace("A request to the Telegram API was unsuccessful. Error code: 400. Description: ", "")
-                print(f"Firewall API Error for {c_id}: {e}")
-                return f"{c_name} (⚠️ Error: {err_msg})"
+    if not verifiable_channels:
+        return True, []
 
-        # Use parallel checks to avoid sequential network delays
-        with ThreadPoolExecutor(max_workers=len(channels_to_check)) as executor:
-            results = list(executor.map(check_channel, channels_to_check))
-            
-        for res in results:
-            if res is not None:
-                missing_channels.append(res)
-                
+    joined = True
+    missing_channels = []
+    
+    def check_channel(channel):
+        c_id = str(channel.get("chat_id")).strip()
+        c_name = str(channel.get("name") or c_id)
+        c_ref = int(c_id) if c_id.lstrip("-").isdigit() else c_id
+        
+        try:
+            member = bot.get_chat_member(c_ref, user_id)
+            if member.status in JOINED_STATUSES:
+                return None
+            return c_name
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ["chat not found", "bot was kicked", "user not found", "member list is inaccessible"]):
+                return None # Don't block if bot can't see channel
+            return c_name
+
+    # Use parallel checks to avoid sequential network delays
+    with ThreadPoolExecutor(max_workers=len(verifiable_channels)) as executor:
+        results = list(executor.map(check_channel, verifiable_channels))
+        
+    missing_channels = [res for res in results if res is not None]
     joined = len(missing_channels) == 0
 
     # Sync with database tracking table for relay accuracy
@@ -1528,12 +1449,10 @@ def is_user_joined_detailed(user_id, force_refresh=False):
                 c.execute("""
                     INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
                     VALUES (%s, TRUE, TRUE)
-                    ON CONFLICT (user_id) DO UPDATE SET currently_joined = TRUE
+                    ON CONFLICT (user_id) DO UPDATE SET 
+                        passed_ever = TRUE, 
+                        currently_joined = TRUE
                 """, (user_id,))
-                
-                # Update main users table for historical stats
-                c.execute("UPDATE users SET passed_firewall_ever = TRUE WHERE user_id = %s", (user_id,))
-
 
     with force_join_cache_lock:
         force_join_cache[cache_key] = (joined, now)
@@ -2002,27 +1921,12 @@ def referral_command(message):
         print("Referral error:", e)
         bot.send_message(user_id, "⚠️ Failed to generate referral link. Try again later.")
 
-@bot.message_handler(commands=['setname', 'changename'])
-def set_name_cmd(message):
-    user_id = message.chat.id
-    if is_banned(user_id):
-        return
-        
-    pending_name_change.add(user_id)
-    current_name = get_username(user_id)
-    msg = "📝 *Change Bot Display Name*\n\n"
-    if current_name:
-        msg += f"Current Name: `{current_name}`\n\n"
-    msg += "Please send your *new name* (3-20 characters, no spaces)."
-    
-    bot.send_message(user_id, msg, parse_mode="Markdown")
-
 # =========================
 # 🏷 USERNAME CAPTURE
 # =========================
 
 @bot.message_handler(
-    func=lambda m: get_username(m.chat.id) is None or m.chat.id in pending_name_change,
+    func=lambda m: get_username(m.chat.id) is None,
     content_types=['text']
 )
 def capture_username(message):
@@ -2034,8 +1938,8 @@ def capture_username(message):
     if username.startswith('/'):
         return
 
-    if len(username) < 3 or len(username) > 20:
-        bot.send_message(user_id, "Name must be between 3 and 20 characters. Try again.")
+    if len(username) < 3:
+        bot.send_message(user_id, "Username too short. Try again.")
         return
 
     if username_taken(username):
@@ -2043,9 +1947,6 @@ def capture_username(message):
         return
 
     set_username(user_id, username)
-    if user_id in pending_name_change:
-        pending_name_change.remove(user_id)
-        
     if get_recovery_ban_for_username(username):
         ban_user(user_id)
         bot.send_message(user_id, "Username recovered from backup with banned status.")
@@ -2086,10 +1987,6 @@ def handle_restrictions(message):
     user_id = message.chat.id
     state = get_user_state(user_id)
 
-    # 👑 Admin/VIP/Whitelist Bypass (Global)
-    if state == "ADMIN" or is_vip(user_id) or is_whitelisted(user_id):
-        return False
-
     # 🛡️ Force Join Check (Firewall)
     if is_force_join_enabled():
         if not is_user_joined(user_id):
@@ -2097,15 +1994,18 @@ def handle_restrictions(message):
                 send_force_join_ui(user_id)
             return True
 
-    # 🚧 Maintenance Mode Check
-    if is_maintenance_mode() and not is_admin(user_id):
-        bot.send_message(user_id, get_maintenance_message(), parse_mode="Markdown")
-        return True
-
     # 🚫 Manual Ban
     if state == "BANNED":
         bot.send_message(user_id, "🚫 You are banned.")
         return True
+
+    # 👑 Admin Bypass
+    if state == "ADMIN":
+        return False
+
+    # ⭐ Whitelisted = Always Active
+    if is_whitelisted(user_id):
+        return False
 
     # 🚫 Word Filter (text only)
     if message.content_type == "text":
@@ -2143,7 +2043,7 @@ def handle_restrictions(message):
     # =========================
     if state == "JOINING":
 
-        if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+        if message.content_type in ['photo', 'video']:
 
             with activation_lock:
                 activation_buffer[user_id] += 1
@@ -2193,7 +2093,7 @@ def handle_restrictions(message):
     # =========================
     if state == "INACTIVE":
 
-        if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+        if message.content_type in ['photo', 'video']:
 
             with activation_lock:
                 activation_buffer[user_id] += 1
@@ -2243,7 +2143,7 @@ def handle_restrictions(message):
     # =========================
     if state == "ACTIVE":
 
-        if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+        if message.content_type in ['photo', 'video']:
 
             increment_media(user_id)
             renewed = check_activation(user_id)
@@ -2535,7 +2435,7 @@ def _process_single(message):
         with cache_lock:
             receivers = [
                 uid for uid in receivers
-                if uid in cached_admins or uid in cached_vips or uid in cached_whitelisted or tracking_data.get(uid, False)
+                if uid in cached_admins or uid in cached_vips or tracking_data.get(uid, False)
             ]
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
@@ -2642,7 +2542,7 @@ def _process_album(messages):
         with cache_lock:
             receivers = [
                 uid for uid in receivers
-                if uid in cached_admins or uid in cached_vips or uid in cached_whitelisted or tracking_data.get(uid, False)
+                if uid in cached_admins or uid in cached_vips or tracking_data.get(uid, False)
             ]
     extra_targets = [cid for cid in get_forward_targets() if cid != sender_id]
     targets = list(dict.fromkeys(receivers + extra_targets))
@@ -2687,33 +2587,6 @@ def _process_album(messages):
             media_items.append((
                 InputMediaVideo(
                     media=msg.video.file_id,
-                    caption=new_caption,
-                    caption_entities=new_ents
-                ),
-                msg.message_id,
-            ))
-        elif msg.content_type == "document":
-            media_items.append((
-                InputMediaDocument(
-                    media=msg.document.file_id,
-                    caption=new_caption,
-                    caption_entities=new_ents
-                ),
-                msg.message_id,
-            ))
-        elif msg.content_type == "audio":
-            media_items.append((
-                InputMediaAudio(
-                    media=msg.audio.file_id,
-                    caption=new_caption,
-                    caption_entities=new_ents
-                ),
-                msg.message_id,
-            ))
-        elif msg.content_type == "animation":
-            media_items.append((
-                InputMediaAnimation(
-                    media=msg.animation.file_id,
                     caption=new_caption,
                     caption_entities=new_ents
                 ),
@@ -2864,22 +2737,9 @@ def perform_admin_search(message, query):
 
 
 @bot.message_handler(
-    func=lambda m: (
-        m.chat.id in pending_fw_add or 
-        m.chat.id in pending_fw_remove or 
-        m.chat.id in pending_vip_add or 
-        m.chat.id in pending_vip_remove or 
-        m.chat.id in pending_fw_msg or 
-        m.chat.id in pending_admin_broadcast or 
-        m.chat.id in pending_admin_setcaption or 
-        m.chat.id in pending_admin_setwelcome or 
-        m.chat.id in pending_admin_setinactive or 
-        m.chat.id in pending_admin_setcontact or 
-        m.chat.id in pending_admin_addforward or 
-        m.chat.id in pending_recovery_import or 
-        m.chat.id in pending_admin_msg_target or 
-        m.chat.id in pending_admin_set_note
-    ),
+    func=lambda m: m.chat.id in (
+        pending_fw_add | pending_fw_remove | pending_vip_add | pending_vip_remove | pending_fw_msg | pending_admin_broadcast | pending_admin_setcaption | pending_admin_setwelcome | pending_admin_setinactive | pending_admin_setcontact | pending_admin_addforward
+    ) or m.chat.id in pending_admin_msg_target or m.chat.id in pending_admin_set_note,
     content_types=['text', 'photo', 'video', 'document', 'audio', 'voice']
 )
 def handle_admin_pending_inputs(message):
@@ -2895,53 +2755,8 @@ def handle_admin_pending_inputs(message):
         pending_admin_setinactive.discard(message.chat.id)
         pending_admin_setcontact.discard(message.chat.id)
         pending_admin_addforward.discard(message.chat.id)
-        pending_recovery_import.discard(message.chat.id)
-        pending_admin_msg_target.discard(message.chat.id)
-        pending_admin_set_note.discard(message.chat.id)
         return
 
-    # Handle Cancel
-    if message.content_type == 'text' and message.text == '/cancel':
-        pending_fw_add.discard(message.chat.id)
-        pending_fw_remove.discard(message.chat.id)
-        pending_vip_add.discard(message.chat.id)
-        pending_vip_remove.discard(message.chat.id)
-        pending_fw_msg.discard(message.chat.id)
-        pending_admin_broadcast.discard(message.chat.id)
-        pending_admin_setcaption.discard(message.chat.id)
-        pending_admin_setwelcome.discard(message.chat.id)
-        pending_admin_setinactive.discard(message.chat.id)
-        pending_admin_setcontact.discard(message.chat.id)
-        pending_admin_addforward.discard(message.chat.id)
-        pending_recovery_import.discard(message.chat.id)
-        pending_admin_msg_target.discard(message.chat.id)
-        pending_admin_set_note.discard(message.chat.id)
-        bot.send_message(message.chat.id, "❌ Action cancelled.")
-        return
-
-    # Special handling for Recovery Document
-    if message.chat.id in pending_recovery_import or message.from_user.id in pending_recovery_import:
-        if message.content_type != 'document':
-            bot.send_message(message.chat.id, "⚠️ Please send the JSON file as a document, or type /cancel.")
-            return
-        
-        try:
-            file_info = bot.get_file(message.document.file_id)
-            raw = bot.download_file(file_info.file_path)
-            import json
-            payload = json.loads(raw.decode('utf-8'))
-            imported_users, imported_words = import_recovery_payload(payload)
-            pending_recovery_import.discard(message.chat.id)
-            bot.send_message(
-                message.chat.id,
-                f"✅ Recovery import complete.\n\n👤 Users: `{imported_users}`\n🚫 Banned Words: `{imported_words}`",
-                parse_mode="Markdown"
-            )
-        except Exception as e:
-            bot.send_message(message.chat.id, f"❌ Import failed: {e}")
-        return
-
-    # For everything else, we require text
     if message.content_type != 'text':
         bot.send_message(message.chat.id, "⚠️ Please send text only for this input, or type /cancel to abort.")
         return
@@ -2998,10 +2813,12 @@ def handle_admin_pending_inputs(message):
         if text.lower() == "/cancel":
             bot.send_message(message.chat.id, "❌ Broadcast cancelled.")
             pending_admin_broadcast.discard(message.chat.id)
-            pending_admin_broadcast_target.pop(message.chat.id, None)
+            with admin_state_lock:
+                pending_admin_broadcast_target.pop(message.chat.id, None)
             return
         
-        target = pending_admin_broadcast_target.pop(message.chat.id, "all")
+        with admin_state_lock:
+            target = pending_admin_broadcast_target.pop(message.chat.id, "all")
         pending_admin_broadcast.discard(message.chat.id)
         
         bot.send_message(message.chat.id, f"🚀 Starting targeted broadcast to: *{target.upper()}*...", parse_mode="Markdown")
@@ -3110,7 +2927,8 @@ def handle_admin_pending_inputs(message):
         return
 
     if message.chat.id in pending_admin_msg_target:
-        uid = pending_admin_msg_target.pop(message.chat.id)
+        with admin_state_lock:
+            uid = pending_admin_msg_target.pop(message.chat.id)
         if text.lower() == "/cancel":
             bot.send_message(message.chat.id, "Message cancelled.")
             return
@@ -3122,7 +2940,8 @@ def handle_admin_pending_inputs(message):
         return
 
     if message.chat.id in pending_admin_set_note:
-        uid = pending_admin_set_note.pop(message.chat.id)
+        with admin_state_lock:
+            uid = pending_admin_set_note.pop(message.chat.id)
         if text.lower() == "/cancel":
             bot.send_message(message.chat.id, "Note update cancelled.")
             return
@@ -3161,7 +2980,7 @@ def handle_admin_pending_inputs(message):
 
 @bot.message_handler(
     func=lambda m: not m.text or not m.text.startswith('/'),
-    content_types=['text', 'photo', 'video', 'document', 'audio', 'animation']
+    content_types=['text', 'photo', 'video']
 )
 def relay(message):
 
@@ -3187,18 +3006,17 @@ def relay(message):
     # ♻ DUPLICATE FILTER (EARLY)
     # =========================
     if message.content_type in ['photo', 'video'] and is_duplicate_filter_enabled():
-        # Bypass for Admins, VIPs, and Whitelisted users
-        if not is_admin(message.chat.id) and not is_vip(message.chat.id) and not is_whitelisted(message.chat.id):
-            file_id = (
-                message.photo[-1].file_id
-                if message.content_type == 'photo'
-                else message.video.file_id
-            )
 
-            is_dup = check_and_register_duplicate(file_id, message.chat.id)
+        file_id = (
+            message.photo[-1].file_id
+            if message.content_type == 'photo'
+            else message.video.file_id
+        )
 
-            if is_dup:
-                return  # silently ignore and DO NOT count activation
+        is_dup = check_and_register_duplicate(file_id, message.chat.id)
+
+        if is_dup:
+            return  # silently ignore and DO NOT count activation
 
     # 🆕 Ensure user exists in database even if they bypassed /start
     if not user_exists(message.chat.id):
@@ -3210,36 +3028,34 @@ def relay(message):
     # 1️⃣ TELEGRAM ALBUM
     # =========================
     if message.media_group_id:
+
         group_id = message.media_group_id
-        with album_lock:
-            media_groups[group_id].append(message)
-            last_album_time[group_id] = time.time()
-            if group_id in album_timers:
-                return
-            album_timers[group_id] = True
+        media_groups[group_id].append(message)
+
+        if group_id in album_timers:
+            return
+
+        album_timers[group_id] = True
 
         def finalize():
-            while True:
-                time.sleep(0.5)
-                with album_lock:
-                    if time.time() - last_album_time.get(group_id, 0) >= 1.5:
-                        album = media_groups.pop(group_id, [])
-                        album_timers.pop(group_id, None)
-                        last_album_time.pop(group_id, None)
-                        break
+            time.sleep(1.0)
+
+            album = media_groups.pop(group_id, [])
+            album_timers.pop(group_id, None)
+
             if album:
                 broadcast_queue.put({
                     "type": "album",
                     "messages": album
                 })
 
-        threading.Thread(target=finalize, daemon=True).start()
+        threading.Thread(target=finalize).start()
         return
 
     # =========================
-    # 2️⃣ SINGLE MEDIA
+    # 2️⃣ SINGLE PHOTO/VIDEO
     # =========================
-    if message.content_type in ['photo', 'video', 'document', 'audio', 'animation']:
+    if message.content_type in ['photo', 'video']:
         broadcast_queue.put({
             "type": "single",
             "message": message
@@ -3302,94 +3118,6 @@ def message_map_cleanup_scheduler():
         time.sleep(MAP_CLEANUP_INTERVAL_SECONDS)
 
 
-def message_map_overflow_guard():
-    """Auto-delete oldest message_map rows when total count exceeds MAP_MAX_SIZE."""
-    while True:
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT COUNT(*) FROM message_map")
-                    total = c.fetchone()[0]
-
-            if total > MAP_MAX_SIZE:
-                to_delete = total - MAP_MAX_SIZE
-                print(f"[MapGuard] message_map has {total} rows, pruning {to_delete} oldest rows...")
-                deleted = 0
-                while deleted < to_delete:
-                    batch = min(MAP_DELETE_BATCH_SIZE, to_delete - deleted)
-                    with get_connection() as conn:
-                        with conn.cursor() as c:
-                            c.execute(
-                                """
-                                WITH batch AS (
-                                    SELECT ctid FROM message_map
-                                    ORDER BY created_at ASC
-                                    LIMIT %s
-                                )
-                                DELETE FROM message_map
-                                USING batch
-                                WHERE message_map.ctid = batch.ctid
-                                RETURNING 1
-                                """,
-                                (batch,)
-                            )
-                            removed = len(c.fetchall())
-                    deleted += removed
-                    if removed < batch:
-                        break
-                print(f"[MapGuard] Pruned {deleted} rows. New count: {total - deleted}")
-        except Exception as e:
-            print(f"[MapGuard] Error: {e}")
-        time.sleep(3600)  # check once per hour
-
-
-def auto_db_backup_scheduler():
-    """Send a DB export JSON to all admins every DB_BACKUP_INTERVAL_HOURS hours."""
-    # Wait 5 minutes after startup before the first backup
-    time.sleep(300)
-    while True:
-        try:
-            payload = export_recovery_payload()
-            temp_path = None
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT user_id FROM admins")
-                    admin_ids = [row[0] for row in c.fetchall()]
-
-            import datetime
-            ts = datetime.datetime.utcnow().strftime("%Y-%m-%d_%H-%M")
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8",
-                                            prefix=f"db_backup_{ts}_") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-                temp_path = f.name
-
-            for admin_id in admin_ids:
-                try:
-                    with open(temp_path, "rb") as doc:
-                        bot.send_document(
-                            admin_id,
-                            doc,
-                            caption=(
-                                f"🗄 *Auto DB Backup*\n"
-                                f"🕐 `{ts} UTC`\n"
-                                f"📦 Contains: users, banned list, admin notes, settings"
-                            ),
-                            parse_mode="Markdown"
-                        )
-                except Exception as e:
-                    print(f"[Backup] Failed to send to admin {admin_id}: {e}")
-        except Exception as e:
-            print(f"[Backup] Export error: {e}")
-        finally:
-            try:
-                if temp_path and os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-
-        time.sleep(DB_BACKUP_INTERVAL_HOURS * 3600)
-
-
 def force_join_enforcement_scheduler():
     while True:
         try:
@@ -3412,55 +3140,6 @@ def force_join_enforcement_scheduler():
             print("Force join check error:", e)
 
         time.sleep(300)
-
-
-def firewall_hourly_cleanup_scheduler():
-    """Truncates firewall_tracking every hour to save space and force re-verification."""
-    while True:
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("TRUNCATE firewall_tracking")
-            
-            # Clear memory cache so the bot performs fresh checks
-            with force_join_cache_lock:
-                force_join_cache.clear()
-                
-            print("🕒 Firewall tracking table truncated and cache cleared (Hourly Cleanup).")
-        except Exception as e:
-            print(f"Firewall cleanup error: {e}")
-        
-        time.sleep(3600)
-
-
-def keep_alive_scheduler():
-    """Self-ping to keep Render Web Service awake and check DB health."""
-    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL")
-    
-    print(f"📡 Keep-alive thread started. Monitoring URL: {url or 'NONE'}")
-    
-    while True:
-        # 1. URL Heartbeat
-        if url:
-            try:
-                # Wait 30s before first ping to allow server boot
-                time.sleep(30)
-                response = requests.get(url, timeout=15)
-                print(f"📡 Web Heartbeat: OK ({response.status_code})")
-            except Exception as e:
-                print(f"📡 Web Heartbeat: FAILED: {e}")
-        
-        # 2. Database Heartbeat
-        try:
-            with get_connection() as conn:
-                with conn.cursor() as c:
-                    c.execute("SELECT 1")
-            print("📡 Database Heartbeat: OK")
-        except Exception as e:
-            print(f"📡 Database Heartbeat: FAILED: {e}. Pool will re-init on next request.")
-
-        # Ping every 10 minutes (be slightly faster than Render's 15m timeout)
-        time.sleep(10 * 60)
 # =========================
 # 🚀 START BACKGROUND WORKERS
 # =========================
@@ -3491,30 +3170,6 @@ def start_background_workers():
     #     target=force_join_enforcement_scheduler,
     #     daemon=True
     # ).start()
-
-    # Message Map Overflow Guard (auto-purge when > MAP_MAX_SIZE rows)
-    threading.Thread(
-        target=message_map_overflow_guard,
-        daemon=True
-    ).start()
-
-    # Auto DB Backup (sends export to all admins every DB_BACKUP_INTERVAL_HOURS)
-    threading.Thread(
-        target=auto_db_backup_scheduler,
-        daemon=True
-    ).start()
-
-    # Keep Alive (for Render Free Tier)
-    threading.Thread(
-        target=keep_alive_scheduler,
-        daemon=True
-    ).start()
-
-    # Firewall Hourly Cleanup
-    threading.Thread(
-        target=firewall_hourly_cleanup_scheduler,
-        daemon=True
-    ).start()
     
 # =========================
 # ADMIN COMMANDS
@@ -3704,11 +3359,6 @@ def _panel_system_markup():
         InlineKeyboardButton("📤 Export", callback_data="admin_export_recovery"),
         InlineKeyboardButton("📥 Import", callback_data="admin_import_recovery"),
     )
-    
-    m_mode = is_maintenance_mode()
-    m_text = "🟢 Disable Maintenance" if m_mode else "🚧 Enable Maintenance"
-    markup.add(InlineKeyboardButton(m_text, callback_data="admin_toggle_maintenance"))
-
     markup.add(
         InlineKeyboardButton("🧹 Clear Map", callback_data="admin_clearmap"),
         InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
@@ -3769,47 +3419,7 @@ def _panel_moderation_markup():
         InlineKeyboardButton("➕ Add Forward", callback_data="admin_addforward"),
         InlineKeyboardButton("⏳ Set Inactive", callback_data="admin_setinactive")
     )
-    markup.add(
-        InlineKeyboardButton("🎁 Global Gift Menu", callback_data="admin_global_gift_menu")
-    )
     markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_back"))
-    return markup
-
-def _panel_global_gift_markup(admin_id):
-    data = pending_admin_global_gift_data.get(admin_id, {"target": "all", "hours": 12})
-    target = data.get("target", "all")
-    hours = data.get("hours", 12)
-    
-    markup = InlineKeyboardMarkup(row_width=3)
-    
-    # Target Selection
-    t_all = "✅ All Users" if target == "all" else "All Users"
-    t_senders = "✅ Senders" if target == "senders" else "Senders Only"
-    t_none = "✅ Newbies" if target == "non_senders" else "Non-Senders"
-    
-    markup.add(
-        InlineKeyboardButton(t_all, callback_data="gg_target:all"),
-        InlineKeyboardButton(t_senders, callback_data="gg_target:senders"),
-        InlineKeyboardButton(t_none, callback_data="gg_target:non_senders")
-    )
-    
-    # Hour Selection
-    h1 = "✅ +1h" if hours == 1 else "+1h"
-    h3 = "✅ +3h" if hours == 3 else "+3h"
-    h6 = "✅ +6h" if hours == 6 else "+6h"
-    h12 = f"✅ +{hours}h (Full)" if hours >= 12 else "+Full Cycle"
-    
-    markup.add(
-        InlineKeyboardButton(h1, callback_data="gg_hours:1"),
-        InlineKeyboardButton(h3, callback_data="gg_hours:3"),
-        InlineKeyboardButton(h6, callback_data="gg_hours:6")
-    )
-    markup.add(InlineKeyboardButton(h12, callback_data="gg_hours:12"))
-    
-    # Action Buttons
-    markup.add(InlineKeyboardButton("🚀 EXECUTE GLOBAL GIFT", callback_data="gg_execute"))
-    markup.add(InlineKeyboardButton("🔙 Back", callback_data="panel_moderation"))
-    
     return markup
 
 
@@ -4087,11 +3697,11 @@ def info_command(message):
             with conn.cursor() as c:
                 c.execute("""
                     SELECT u.username, u.joined_at, u.last_activation_time, u.total_media_sent, COUNT(r.user_id),
-                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                           u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username
                     FROM users u
                     LEFT JOIN users r ON r.referred_by = u.user_id
                     WHERE u.user_id = %s
-                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username, u.banned
+                    GROUP BY u.user_id, u.username, u.joined_at, u.last_activation_time, u.total_media_sent, u.first_name, u.last_name, u.admin_notes, u.reputation, u.tg_username
                 """, (user_id,))
                 row = c.fetchone()
                 
@@ -4099,13 +3709,13 @@ def info_command(message):
             bot.send_message(message.chat.id, "❌ <b>Error:</b> Profile data not found for user ID.")
             return
             
-        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username, is_banned_user = row
+        bot_username, joined_at, last_active, media, refs, first_name, last_name, notes, reputation, tg_username = row
         now = int(time.time())
         import datetime
         joined_str = datetime.datetime.fromtimestamp(joined_at).strftime('%d %b %Y') if joined_at else "Unknown"
         
-        status_str = "🔴 BANNED" if is_banned_user else "🔴 Inactive"
-        if not is_banned_user and last_active:
+        status_str = "🔴 Inactive"
+        if last_active:
             time_passed = now - last_active
             time_left = max(0, get_inactivity_limit() - time_passed)
             if time_left > 0:
@@ -4141,26 +3751,21 @@ def info_command(message):
         )
         
         markup = InlineKeyboardMarkup(row_width=2)
+        dm_url = f"https://t.me/{tg_username}" if tg_username else f"tg://user?id={user_id}"
+        
         markup.add(
             InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{user_id}"),
             InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{user_id}")
         )
-        if tg_username:
-            markup.add(
-                InlineKeyboardButton("👤 Direct DM", url=f"https://t.me/{tg_username}"),
-                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
-            )
-        else:
-            markup.add(
-                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
-            )
-        ban_btn = InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_user:{user_id}") if is_banned_user else InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}")
         markup.add(
-            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
-            ban_btn
+            InlineKeyboardButton("👤 Direct DM", url=dm_url),
+            InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{user_id}")
         )
         markup.add(
-            InlineKeyboardButton("🎁 Gift Cycle", callback_data=f"admin_gift_cycle:{user_id}"),
+            InlineKeyboardButton("📝 Edit Note", callback_data=f"admin_start_note:{user_id}"),
+            InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{user_id}")
+        )
+        markup.add(
             InlineKeyboardButton("🔙 Close", callback_data="delete_message")
         )
         
@@ -4645,44 +4250,6 @@ def set_firewall_message_cmd(message):
     bot.send_message(message.chat.id, "✅ Firewall message updated.")
 
 
-@bot.message_handler(commands=['clearfirewall'])
-def clear_firewall_cmd(message):
-    if not is_admin(message.chat.id):
-        return
-
-    with get_connection() as conn:
-        with conn.cursor() as c:
-            c.execute("TRUNCATE firewall_tracking")
-    
-    # Clear memory cache so the bot performs fresh checks
-    with force_join_cache_lock:
-        force_join_cache.clear()
-    
-    bot.send_message(message.chat.id, "✅ Firewall tracking table and cache have been cleared. Everyone must re-verify.")
-
-
-@bot.message_handler(commands=['maintenance'])
-def maintenance_cmd(message):
-    if not is_admin(message.chat.id):
-        return
-    
-    parts = message.text.split()
-    if len(parts) < 2:
-        curr = "ENABLED" if is_maintenance_mode() else "DISABLED"
-        bot.send_message(message.chat.id, f"Current Maintenance Mode: **{curr}**\n\nUse `/maintenance on` or `/maintenance off`", parse_mode="Markdown")
-        return
-    
-    target = parts[1].lower()
-    if target == "on":
-        set_maintenance_mode(True)
-        bot.send_message(message.chat.id, "🚧 Maintenance mode **ENABLED**. Users are now blocked.", parse_mode="Markdown")
-    elif target == "off":
-        set_maintenance_mode(False)
-        bot.send_message(message.chat.id, "✅ Maintenance mode **DISABLED**. Users can now use the bot.", parse_mode="Markdown")
-    else:
-        bot.send_message(message.chat.id, "Invalid option. Use `on` or `off`.")
-
-
 @bot.message_handler(commands=['broadcast'])
 def broadcast_cmd(message):
     if not is_admin(message.chat.id):
@@ -4816,10 +4383,6 @@ def check_join_callback(call):
                         passed_ever = TRUE, 
                         currently_joined = TRUE
                 """, (user_id,))
-                
-                # Update main users table for historical stats
-                c.execute("UPDATE users SET passed_firewall_ever = TRUE WHERE user_id = %s", (user_id,))
-
         try:
             bot.edit_message_text(
                 "✅ You have joined all required channels.\n\n🎉 Access granted!",
@@ -4868,10 +4431,6 @@ def handle_chat_member_update(message):
                         passed_ever = TRUE, 
                         currently_joined = TRUE
                 """, (user_id,))
-                
-                # Update main users table for historical stats
-                c.execute("UPDATE users SET passed_firewall_ever = TRUE WHERE user_id = %s", (user_id,))
-
                 
                 if not row or not row[0]:
                     # User passed firewall for the first time
@@ -5105,7 +4664,8 @@ def admin_extra_callbacks(call):
     if data.startswith("bc_target:"):
         target = data.split(":")[1]
         pending_admin_broadcast.add(actor_id)
-        pending_admin_broadcast_target[actor_id] = target
+        with admin_state_lock:
+            pending_admin_broadcast_target[actor_id] = target
         bot.answer_callback_query(call.id, f"Target: {target}")
         bot.edit_message_text(
             f"📣 *BROADCAST TO {target.upper()}*\n\n"
@@ -5123,15 +4683,6 @@ def admin_extra_callbacks(call):
             with conn.cursor() as c:
                 c.execute("UPDATE users SET banned=FALSE, auto_banned=FALSE WHERE user_id=%s", (uid,))
         bot.answer_callback_query(call.id, "✅ User unbanned.")
-        # Refresh profile
-        call.data = f"admin_user_info:{uid}:0:all"
-        admin_callbacks(call)
-        return
-
-    if data.startswith("admin_gift_cycle:"):
-        uid = int(data.split(":")[1])
-        grant_full_cycle(uid)
-        bot.answer_callback_query(call.id, "🎁 Full Cycle Gifted!", show_alert=True)
         # Refresh profile
         call.data = f"admin_user_info:{uid}:0:all"
         admin_callbacks(call)
@@ -5187,18 +4738,14 @@ def firewall_ui_callbacks(call):
                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
                     """
                 )
-        refresh_caches()
+        _clear_force_join_cache()
         bot.answer_callback_query(call.id, "🧱 Firewall Enabled")
-        call.data = "panel_firewall"
-        panel_navigation_callbacks(call)
         return
 
     if call.data == "fw_off":
         disable_force_join()
         refresh_caches()
         bot.answer_callback_query(call.id, "🧱 Firewall Disabled")
-        call.data = "panel_firewall"
-        panel_navigation_callbacks(call)
         return
 
     if call.data == "fw_add":
@@ -5281,7 +4828,7 @@ def firewall_ui_callbacks(call):
                 c.execute("SELECT COUNT(*) FROM firewall_tracking WHERE msg_received=TRUE")
                 msg_count = c.fetchone()[0]
                 
-                c.execute("SELECT COUNT(*) FROM users WHERE passed_firewall_ever=TRUE")
+                c.execute("SELECT COUNT(*) FROM firewall_tracking WHERE passed_ever=TRUE")
                 passed_count = c.fetchone()[0]
                 
                 c.execute("SELECT COUNT(*) FROM firewall_tracking WHERE currently_joined=TRUE")
@@ -5350,28 +4897,6 @@ def admin_callbacks(call):
         bot.answer_callback_query(call.id, "Awaiting forward target")
         bot.send_message(call.from_user.id, "➕ Send the CHAT_ID for the forward target. You can also forward a text message from the target channel/group here. Type /cancel to abort.")
 
-    elif data == "admin_toggle_maintenance":
-        new_status = not is_maintenance_mode()
-        set_maintenance_mode(new_status)
-        bot.answer_callback_query(call.id, f"Maintenance {'Enabled' if new_status else 'Disabled'}")
-        
-        # Refresh the system panel
-        panel_text = (
-            "⚙️ *TERMINAL CONFIG*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            f"> Status: `{'MAINTENANCE' if new_status else 'LIVE'}`\n"
-            "> Database: `CONNECTED`\n"
-            "> Backup: `READY`\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Maintain core bot infrastructure."
-        )
-        _panel_send_or_edit(
-            call.message.chat.id,
-            panel_text,
-            _panel_system_markup(),
-            message_id=call.message.message_id,
-        )
-
     elif data == "admin_banned":
         with get_connection() as conn:
             with conn.cursor() as c:
@@ -5386,55 +4911,6 @@ def admin_callbacks(call):
             text = "No banned users."
 
         bot.send_message(call.message.chat.id, text)
-
-    elif data == "admin_global_gift_menu":
-        if call.from_user.id not in pending_admin_global_gift_data:
-            pending_admin_global_gift_data[call.from_user.id] = {"target": "all", "hours": 12}
-        
-        text = (
-            "🎁 *GLOBAL GIFT CONFIGURATION*\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Choose who to gift and for how long.\n\n"
-            "🔹 *Target:* `Everyone` | `Senders` | `Newbies`\n"
-            "🔹 *Duration:* `1h` to `12h`\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "Click execute to apply to the entire database."
-        )
-        bot.edit_message_text(
-            text,
-            call.message.chat.id,
-            call.message.message_id,
-            reply_markup=_panel_global_gift_markup(call.from_user.id),
-            parse_mode="Markdown"
-        )
-
-    elif data.startswith("gg_target:"):
-        target = data.split(":")[1]
-        if call.from_user.id not in pending_admin_global_gift_data:
-            pending_admin_global_gift_data[call.from_user.id] = {"target": "all", "hours": 12}
-        pending_admin_global_gift_data[call.from_user.id]["target"] = target
-        bot.answer_callback_query(call.id, f"Target set to: {target}")
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_panel_global_gift_markup(call.from_user.id))
-
-    elif data.startswith("gg_hours:"):
-        hours = int(data.split(":")[1])
-        if call.from_user.id not in pending_admin_global_gift_data:
-            pending_admin_global_gift_data[call.from_user.id] = {"target": "all", "hours": 12}
-        pending_admin_global_gift_data[call.from_user.id]["hours"] = hours
-        bot.answer_callback_query(call.id, f"Duration set to: {hours}h")
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=_panel_global_gift_markup(call.from_user.id))
-
-    elif data == "gg_execute":
-        config = pending_admin_global_gift_data.get(call.from_user.id, {"target": "all", "hours": 12})
-        grant_global_free_cycle(target=config["target"], hours=config["hours"])
-        bot.answer_callback_query(call.id, "🚀 Global Gift Executed!", show_alert=True)
-        # Refresh panel or go back
-        call.data = "panel_moderation"
-        panel_navigation_callbacks(call)
-
-    elif data == "admin_global_gift":
-        grant_global_free_cycle()
-        bot.answer_callback_query(call.id, "🎁 Everyone received a free cycle!", show_alert=True)
 
     elif data.startswith("admin_userlist"):
         bot.answer_callback_query(call.id)
@@ -5608,20 +5084,17 @@ def admin_callbacks(call):
         )
         
         markup = InlineKeyboardMarkup(row_width=2)
+        
+        dm_url = f"https://t.me/{tg_username}" if tg_username else f"tg://user?id={uid}"
+        
         markup.add(
             InlineKeyboardButton("📂 View Files", callback_data=f"admin_view_files:{uid}"),
             InlineKeyboardButton("✉️ Message", callback_data=f"admin_msg_user:{uid}")
         )
-        
-        if tg_username:
-            markup.add(
-                InlineKeyboardButton("👤 Direct DM", url=f"https://t.me/{tg_username}"),
-                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
-            )
-        else:
-            markup.add(
-                InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
-            )
+        markup.add(
+            InlineKeyboardButton("👤 Direct DM", url=dm_url),
+            InlineKeyboardButton("🏷 Set Reputation", callback_data=f"admin_show_reps:{uid}")
+        )
         
         ban_btn = InlineKeyboardButton("✅ Unban User", callback_data=f"admin_unban_user:{uid}") if is_banned_user else InlineKeyboardButton("🚫 Ban User", callback_data=f"admin_ban_user:{uid}")
 
@@ -5630,7 +5103,6 @@ def admin_callbacks(call):
             ban_btn
         )
         markup.add(
-            InlineKeyboardButton("🎁 Gift Cycle", callback_data=f"admin_gift_cycle:{uid}"),
             InlineKeyboardButton("🔙 Close", callback_data="delete_message")
         )
         
@@ -5680,14 +5152,16 @@ def admin_callbacks(call):
 
     elif data.startswith("admin_start_note:"):
         uid = int(data.split(":")[1])
-        pending_admin_set_note[call.from_user.id] = uid
+        with admin_state_lock:
+            pending_admin_set_note[call.from_user.id] = uid
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, "📝 Send the private note for this user:\n(Type /cancel to abort)")
         return
 
     elif data.startswith("admin_msg_user:"):
         uid = int(data.split(":")[1])
-        pending_admin_msg_target[call.from_user.id] = uid
+        with admin_state_lock:
+            pending_admin_msg_target[call.from_user.id] = uid
         bot.answer_callback_query(call.id)
         bot.send_message(call.message.chat.id, "✉️ Send the message you want to deliver to this user:\n(Type /cancel to abort)")
         return
@@ -5903,9 +5377,8 @@ def admin_callbacks(call):
                 os.remove(temp_path)
 
     elif data == "admin_import_recovery":
-        bot.answer_callback_query(call.id, "Awaiting recovery file...")
-        pending_recovery_import.add(call.from_user.id)
-        bot.send_message(call.from_user.id, "📁 Please send the recovery JSON file as a **Document**. \n\nType `/cancel` to abort.")
+        pending_recovery_import.add(call.message.chat.id)
+        bot.send_message(call.message.chat.id, "Send the recovery JSON file as a document to import.")
 
     bot.answer_callback_query(call.id)
 
@@ -5946,6 +5419,27 @@ def admin_direct_message(message):
         bot.send_message(message.chat.id, f"✅ Message sent to `{uid}`.")
     except Exception as e:
         bot.send_message(message.chat.id, f"❌ Failed to send: {e}")
+
+@bot.message_handler(content_types=['document'])
+def import_recovery_document(message):
+    if not is_admin(message.chat.id):
+        return
+    if message.chat.id not in pending_recovery_import:
+        return
+
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        raw = bot.download_file(file_info.file_path)
+        payload = json.loads(raw.decode("utf-8"))
+        imported_users, imported_words = import_recovery_payload(payload)
+        pending_recovery_import.discard(message.chat.id)
+        bot.send_message(
+            message.chat.id,
+            f"Recovery import complete.\nUsers imported: {imported_users}\nBanned words imported: {imported_words}",
+        )
+    except Exception as e:
+        bot.send_message(message.chat.id, f"Import failed: {e}")
+
 
 @bot.message_handler(commands=['chatid'], content_types=['text'])
 def get_chat_id(message):
@@ -6038,41 +5532,10 @@ def menu_command(message):
     )
 
 # =========================
-# 🌐 RENDER HEALTH CHECK
-# =========================
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b"Bot is alive!")
-
-    def log_message(self, format, *args):
-        # Silence logging to keep console clean
-        return
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    """Handle health checks in separate threads to prevent blocking."""
-    pass
-
-def run_health_check_server():
-    try:
-        port = int(os.getenv("PORT", "8080"))
-        server = ThreadedHTTPServer(('0.0.0.0', port), HealthCheckHandler)
-        print(f"✅ Health check server listening on 0.0.0.0:{port} (Threaded)")
-        server.serve_forever()
-    except Exception as e:
-        print(f"❌ Health check server failed: {e}")
-
-# =========================
 # 🚀 MAIN BOOT
 # =========================
 
 if __name__ == "__main__":
-
-    # 1. Start Render Health Check Server IMMEDIATELY
-    threading.Thread(target=run_health_check_server, daemon=True).start()
 
     print("Starting bot...")
 
@@ -6084,30 +5547,5 @@ if __name__ == "__main__":
     start_background_workers()
     print("Background workers running.")
 
-    # Safety delay to allow old instances to shut down on Render
-    print("Waiting 10s for session clearance and port stabilization...")
-    time.sleep(10)
-    
-    try:
-        print("Cleaning up old webhooks...")
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print(f"Webhook cleanup note: {e}")
-
-    print("Bot is now polling...")
-    while True:
-        try:
-            bot.infinity_polling(skip_pending=True, timeout=60, long_polling_timeout=60)
-        except telebot.apihelper.ApiTelegramException as e:
-            if e.error_code == 429:
-                # Respect Telegram's retry_after duration
-                retry_after = int(e.result_json.get('parameters', {}).get('retry_after', 30))
-                print(f"⚠️ Rate limited! Sleeping for {retry_after} seconds...")
-                time.sleep(retry_after + 1)
-            else:
-                print(f"Telegram API Error: {e}")
-                time.sleep(15)
-        except Exception as e:
-            print(f"Polling error: {e}")
-            time.sleep(15)
+    bot.infinity_polling(skip_pending=True)
 
