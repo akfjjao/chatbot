@@ -397,6 +397,12 @@ def callback_dispatcher(call):
 
         markup = InlineKeyboardMarkup()
         
+        # Ensure admin_states has a sub-dictionary for options to avoid looping overwrite
+        if chat_id not in admin_states or not isinstance(admin_states[chat_id], dict):
+            admin_states[chat_id] = {}
+        if "options" not in admin_states[chat_id]:
+            admin_states[chat_id]["options"] = {}
+
         for chat in chats_slice:
             chat_id_val = chat["chat_id"]
             chat_title = chat["title"]
@@ -405,8 +411,8 @@ def callback_dispatcher(call):
 
             btn_text = f"{emoji} {chat_title}"
             
-            # Save mapping state in memory
-            admin_states[chat_id] = {
+            # Save mapping state keyed by source ID under the admin's chat session
+            admin_states[chat_id]["options"][chat_id_val] = {
                 "phone": phone,
                 "source_id": chat_id_val,
                 "source_title": chat_title,
@@ -446,11 +452,16 @@ def callback_dispatcher(call):
     # --- FORWARDING RULE MAPPING CREATION ---
     elif data.startswith("map_src:"):
         source_id = int(data.split(":")[1])
-        state = admin_states.get(chat_id)
+        admin_data = admin_states.get(chat_id)
+        options = admin_data.get("options", {}) if isinstance(admin_data, dict) else {}
+        state = options.get(source_id)
         
-        if not state or state["source_id"] != source_id:
+        if not state:
             bot.send_message(chat_id, "❌ Interaction session expired. Please list chats and try again.")
             return
+
+        # Save selected source chat in admin_states for the next callback step (map_tgt)
+        admin_states[chat_id]["selected_source"] = state
 
         targets = db.get_all_targets()
         if not targets:
@@ -481,7 +492,8 @@ def callback_dispatcher(call):
 
     elif data.startswith("map_tgt:"):
         target_id = int(data.split(":")[1])
-        state = admin_states.pop(chat_id, None)
+        admin_data = admin_states.pop(chat_id, None)
+        state = admin_data.get("selected_source") if isinstance(admin_data, dict) else None
         
         if not state:
             bot.send_message(chat_id, "❌ Session expired.")
@@ -579,6 +591,12 @@ def callback_dispatcher(call):
 
         markup = InlineKeyboardMarkup()
         
+        # Ensure admin_states has a targets_options sub-dictionary to avoid loop overwrites
+        if chat_id not in admin_states or not isinstance(admin_states[chat_id], dict):
+            admin_states[chat_id] = {}
+        if "targets_options" not in admin_states[chat_id]:
+            admin_states[chat_id]["targets_options"] = {}
+
         for chat in chats_slice:
             chat_id_val = chat["chat_id"]
             chat_title = chat["title"]
@@ -586,8 +604,8 @@ def callback_dispatcher(call):
 
             btn_text = f"{emoji} {chat_title}"
             
-            # Save selected details in state
-            admin_states[chat_id] = {
+            # Save selected target details keyed by target ID
+            admin_states[chat_id]["targets_options"][chat_id_val] = {
                 "phone": phone,
                 "target_chat_id": chat_id_val,
                 "target_title": chat_title
@@ -618,9 +636,11 @@ def callback_dispatcher(call):
 
     elif data.startswith("save_tgt_exec:"):
         target_id = int(data.split(":")[1])
-        state = admin_states.pop(chat_id, None)
+        admin_data = admin_states.pop(chat_id, None)
+        targets_options = admin_data.get("targets_options", {}) if isinstance(admin_data, dict) else {}
+        state = targets_options.get(target_id)
         
-        if not state or state["target_chat_id"] != target_id:
+        if not state:
             bot.send_message(chat_id, "❌ Target registration session expired.")
             return
 
