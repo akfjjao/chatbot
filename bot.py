@@ -33,6 +33,10 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ⚙ CONFIGURATION
 # =========================
 
+# Backup configuration variables (Drop in configuration section)
+AUTO_BACKUP_INTERVAL_SECONDS = int(os.getenv("AUTO_BACKUP_INTERVAL_SECONDS", "43200"))  # 12 Hours fallback
+LAST_BACKUP_TIME_FILE = os.path.join(tempfile.gettempdir(), "last_bot_backup_timestamp.txt")
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 FIRST_ADMIN_ID = os.getenv("ADMIN_ID") # replace with your Telegram ID for initial admin access
@@ -3161,6 +3165,113 @@ def force_join_enforcement_scheduler():
             print("Force join check error:", e)
 
         time.sleep(300)
+        
+# =========================
+# 📦 AUTOMATED DATABASE BACKUP
+# =========================
+
+def get_backup_target_chat():
+    """
+    Finds a suitable recipient chat for the structural backup data.
+    Prioritizes file viewing group, fallback to initial admin id.
+    """
+    view_chat = get_view_files_chat_id()
+    if view_chat:
+        return view_chat
+    return FIRST_ADMIN_ID
+
+def send_automated_db_backup():
+    """
+    Compiles database states using the operational recovery payload
+    and pushes a JSON document to the administrator stream.
+    """
+    target_chat = get_backup_target_chat()
+    if not target_chat:
+        print("⚠️ Automated Backup Failed: No recipient chat configuration (FIRST_ADMIN_ID or view_files_chat_id) found.")
+        return
+
+    print(f"📦 Initiating automated backup compilation sequence targeting chat: {target_chat}...")
+    try:
+        # Extract operational data from runtime database instances
+        payload = export_recovery_payload()
+        
+        # Build an organized filename containing execution times
+        current_date = time.strftime("%Y-%m-%d_%H-%M")
+        filename = f"bot_recovery_snapshot_{current_date}.json"
+        
+        # Utilize isolated file paths for thread safety
+        temp_dir = tempfile.mkdtemp()
+        temp_file_path = os.path.join(temp_dir, filename)
+        
+        with open(temp_file_path, "w", encoding="utf-8") as backup_file:
+            json.dump(payload, backup_file, ensure_ascii=False, indent=2)
+            
+        # Dispatch document structure securely through the core instance
+        with open(temp_file_path, "rb") as document_stream:
+            bot.send_document(
+                chat_id=target_chat,
+                document=document_stream,
+                caption=(
+                    f"📦 *AUTOMATED DATABASE SYSTEM BACKUP*\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📅 Timestamp: `{time.strftime('%Y-%m-%d %H:%M:%S')}`\n"
+                    f"👥 Active Users Exported: `{len(payload.get('users', []))}`\n"
+                    f"🚫 System Banned Words: `{len(payload.get('banned_words', []))}`\n\n"
+                    f"💡 _Keep this record safe. If the database crashes, clear old infrastructure and feed this file to the Import tool._"
+                ),
+                parse_mode="Markdown"
+            )
+            
+        print("✅ Automated state backup successfully dispatched.")
+        
+        # Housekeeping: Destroy storage structures explicitly 
+        try:
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+            if os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
+        except Exception:
+            pass
+
+    except Exception as backup_error:
+        print(f"❌ State-recovery worker initialization error sequence encountered: {backup_error}")
+
+def auto_backup_scheduler_loop():
+    """
+    Persistent orchestration thread managing scheduling variables independent 
+    of main app polling failures or bot crashes.
+    """
+    # Quick execution warm up on system reboot
+    time.sleep(10)
+    
+    while True:
+        try:
+            should_execute = False
+            now = time.time()
+            
+            # Persistent check against tracking file to maintain intervals across hot reloads
+            if not os.path.exists(LAST_BACKUP_TIME_FILE):
+                should_execute = True
+            else:
+                with open(LAST_BACKUP_TIME_FILE, "r") as f:
+                    try:
+                        last_saved_time = float(f.read().strip())
+                        if (now - last_saved_time) >= AUTO_BACKUP_INTERVAL_SECONDS:
+                            should_execute = True
+                    except ValueError:
+                        should_execute = True
+
+            if should_execute:
+                send_automated_db_backup()
+                with open(LAST_BACKUP_TIME_FILE, "w") as f:
+                    f.write(str(now))
+                    
+        except Exception as scheduler_exception:
+            print(f"⚠️ Warning: Auto-backup scheduler looping issue: {scheduler_exception}")
+            
+        # Perform low footprint timeline calculation checks every 60 seconds
+        time.sleep(60)
+        
 # =========================
 # 🚀 START BACKGROUND WORKERS
 # =========================
@@ -3186,6 +3297,13 @@ def start_background_workers():
         daemon=True
     ).start()
 
+    # Automated State Recovery Engine Registration
+    threading.Thread(
+        target=auto_backup_scheduler_loop,
+        daemon=True
+    ).start()
+    print("🤖 Structural Backup Worker registered running on explicit threads.")
+    
     # Force Join Enforcement Scheduler
     # threading.Thread(
     #     target=force_join_enforcement_scheduler,
@@ -5578,4 +5696,3 @@ if __name__ == "__main__":
     print("Background workers running.")
 
     bot.infinity_polling(skip_pending=True)
-
