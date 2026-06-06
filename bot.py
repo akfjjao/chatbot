@@ -4750,6 +4750,7 @@ def firewall_ui_callbacks(call):
                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
                     """
                 )
+        refresh_caches()
         _clear_force_join_cache()
         bot.answer_callback_query(call.id, "🧱 Firewall Enabled")
         return
