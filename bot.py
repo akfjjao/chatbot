@@ -1946,6 +1946,10 @@ def capture_username(message):
         bot.send_message(user_id, "Username already taken. Try another.")
         return
 
+    # Ensure user exists in database before setting username
+    if not user_exists(user_id):
+        add_user(user_id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
+
     set_username(user_id, username)
     if get_recovery_ban_for_username(username):
         ban_user(user_id)
@@ -4396,6 +4400,10 @@ def check_join_callback(call):
                 pass
             bot.send_message(user_id, "🎉 You have joined all required channels.\n\nAccess granted!")
             
+        # Ensure user exists in database
+        if not user_exists(user_id):
+            add_user(user_id, call.from_user.first_name, call.from_user.last_name, call.from_user.username)
+
         if not get_username(user_id):
             bot.send_message(user_id, get_welcome_message())
     else:
@@ -4442,6 +4450,10 @@ def handle_chat_member_update(message):
                             bot.send_message(log_group, f"🧱 *Firewall Passed*\nUser: `{user_id}` (@{display_name})\nSuccessfully joined required channels.", parse_mode="Markdown")
                         except: pass
                     
+                    # Ensure user exists in database
+                    if not user_exists(user_id):
+                        add_user(user_id, message.from_user.first_name, message.from_user.last_name, message.from_user.username)
+
                     if not username:
                         try:
                             bot.send_message(user_id, "🎉 You have joined all required channels.\n\nAccess granted!")
