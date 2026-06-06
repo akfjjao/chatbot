@@ -1283,6 +1283,14 @@ def set_force_join(chat_id, message):
                 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
                 """
             )
+            # Initialize existing users as currently joined
+            c.execute(
+                """
+                INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
+                SELECT user_id, TRUE, TRUE FROM users
+                ON CONFLICT (user_id) DO UPDATE SET currently_joined = TRUE
+                """
+            )
     refresh_caches()
     _clear_force_join_cache()
     add_force_channel(chat_id)
@@ -1443,15 +1451,22 @@ def is_user_joined_detailed(user_id, force_refresh=False):
     joined = len(missing_channels) == 0
 
     # Sync with database tracking table for relay accuracy
-    if joined:
-        with get_connection() as conn:
-            with conn.cursor() as c:
+    with get_connection() as conn:
+        with conn.cursor() as c:
+            if joined:
                 c.execute("""
                     INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
                     VALUES (%s, TRUE, TRUE)
                     ON CONFLICT (user_id) DO UPDATE SET 
                         passed_ever = TRUE, 
                         currently_joined = TRUE
+                """, (user_id,))
+            else:
+                c.execute("""
+                    INSERT INTO firewall_tracking (user_id, currently_joined)
+                    VALUES (%s, FALSE)
+                    ON CONFLICT (user_id) DO UPDATE SET 
+                        currently_joined = FALSE
                 """, (user_id,))
 
     with force_join_cache_lock:
@@ -4748,6 +4763,14 @@ def firewall_ui_callbacks(call):
                     INSERT INTO settings(key, value)
                     VALUES('force_join_enabled', 'true')
                     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+                    """
+                )
+                # Initialize existing users as currently joined
+                c.execute(
+                    """
+                    INSERT INTO firewall_tracking (user_id, passed_ever, currently_joined)
+                    SELECT user_id, TRUE, TRUE FROM users
+                    ON CONFLICT (user_id) DO UPDATE SET currently_joined = TRUE
                     """
                 )
         refresh_caches()
