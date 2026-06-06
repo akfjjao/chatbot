@@ -34,7 +34,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # =========================
 
 # Backup configuration variables (Drop in configuration section)
-AUTO_BACKUP_INTERVAL_SECONDS = int(os.getenv("AUTO_BACKUP_INTERVAL_SECONDS", "43200"))  # 12 Hours fallback
+AUTO_BACKUP_INTERVAL_SECONDS = int(os.getenv("AUTO_BACKUP_INTERVAL_SECONDS", "14400"))  # 12 Hours fallback
 LAST_BACKUP_TIME_FILE = os.path.join(tempfile.gettempdir(), "last_bot_backup_timestamp.txt")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
