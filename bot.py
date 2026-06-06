@@ -726,29 +726,35 @@ def export_recovery_payload():
         with conn.cursor() as c:
             c.execute(
                 """
-                SELECT username, banned, first_name, last_name, admin_notes, reputation
+                SELECT user_id, username, banned, first_name, last_name, 
+                       admin_notes, reputation, total_media_sent, 
+                       last_activation_time, referred_by
                 FROM users
-                WHERE username IS NOT NULL
-                ORDER BY username
+                ORDER BY user_id
                 """
             )
             users = [{
-                "username": r[0],
-                "banned": bool(r[1]),
-                "first_name": r[2],
-                "last_name": r[3],
-                "admin_notes": r[4],
-                "reputation": r[5]
+                "user_id": r[0],
+                "username": r[1],
+                "banned": bool(r[2]),
+                "first_name": r[3],
+                "last_name": r[4],
+                "admin_notes": r[5],
+                "reputation": r[6],
+                "total_media_sent": r[7] if r[7] is not None else 0,
+                "last_activation_time": r[8], # Holds their exact active timer expiration anchor
+                "referred_by": r[9]
             } for r in c.fetchall()]
+            
             c.execute("SELECT word FROM banned_words ORDER BY word")
             words = [r[0] for r in c.fetchall()]
+            
     return {
-        "version": 1,
+        "version": 2, # Incremented versioning flag
         "exported_at": int(time.time()),
         "users": users,
         "banned_words": words,
     }
-
 
 def import_recovery_payload(payload):
     users = payload.get("users", [])
@@ -759,26 +765,47 @@ def import_recovery_payload(payload):
     with get_connection() as conn:
         with conn.cursor() as c:
             for item in users:
-                username = str(item.get("username", "")).strip().lower()
-                if not username: continue
+                uid = item.get("user_id")
+                username = str(item.get("username", "")).strip().lower() if item.get("username") else None
                 banned = bool(item.get("banned", False))
                 fname = item.get("first_name")
                 lname = item.get("last_name")
                 notes = item.get("admin_notes")
                 rep = item.get("reputation", "Neutral")
+                total_media = item.get("total_media_sent", 0)
+                last_act = item.get("last_activation_time")
+                ref_by = item.get("referred_by")
 
-                c.execute("""
-                    INSERT INTO recovery_users (username, banned)
-                    VALUES (%s, %s)
-                    ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
-                """, (username, banned))
+                # Fallback for old records that didn't export user_id
+                if not uid:
+                    continue 
 
-                # Update main users table if they exist
+                # Insert or fully restore user entity data mapping state
                 c.execute("""
-                    UPDATE users
-                    SET banned = %s, first_name = %s, last_name = %s, admin_notes = %s, reputation = %s
-                    WHERE username = %s
-                """, (banned, fname, lname, notes, rep, username))
+                    INSERT INTO users (user_id, username, banned, first_name, last_name, 
+                                       admin_notes, reputation, total_media_sent, 
+                                       last_activation_time, referred_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        banned = EXCLUDED.banned,
+                        first_name = EXCLUDED.first_name,
+                        last_name = EXCLUDED.last_name,
+                        admin_notes = EXCLUDED.admin_notes,
+                        reputation = EXCLUDED.reputation,
+                        total_media_sent = EXCLUDED.total_media_sent,
+                        last_activation_time = EXCLUDED.last_activation_time,
+                        referred_by = EXCLUDED.referred_by
+                """, (uid, username, banned, fname, lname, notes, rep, total_media, last_act, ref_by))
+                
+                # Maintain legacy username recovery tracking tables
+                if username:
+                    c.execute("""
+                        INSERT INTO recovery_users (username, banned)
+                        VALUES (%s, %s)
+                        ON CONFLICT (username) DO UPDATE SET banned = EXCLUDED.banned
+                    """, (username, banned))
+                    
                 imported_users += 1
 
             for word in words:
@@ -791,16 +818,8 @@ def import_recovery_payload(payload):
                 )
                 imported_words += 1
 
-            c.execute(
-                """
-                UPDATE users u
-                SET banned = r.banned
-                FROM recovery_users r
-                WHERE u.username = r.username
-                """
-            )
-
     return imported_users, imported_words
+
 # =========================
 # 👑 ADMIN HELPERS
 # =========================
